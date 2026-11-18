@@ -29,3 +29,6 @@ Thumbs.db
 bin/
 obj/
 *.user
+
+# Lokální nástroje (menu + web guildy), necommituje se
+local/
