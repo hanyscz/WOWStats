@@ -37,6 +37,30 @@ public sealed record Character(
     DateTimeOffset FetchedAt,
     bool Stale);
 
+public sealed record GuildMember(
+    string? Name,
+    string? Surname,
+    string? Slug,
+    int? Level,
+    string? CharacterClass,
+    string? Race,
+    string? Faction,
+    int? Rank);
+
+/// <summary>Členové jsou seřazení: rank, level sestupně, jméno. Rank je číslo (0 = vedoucí), jména ranků API nevrací.</summary>
+public sealed record Guild(
+    string Name,
+    string Slug,
+    int Id,
+    string? Faction,
+    int MemberCount,
+    int AchievementPoints,
+    DateTimeOffset? CreatedAt,
+    string? Ruleset,
+    IReadOnlyList<GuildMember> Members,
+    DateTimeOffset FetchedAt,
+    bool Stale);
+
 public class WowStatsException : Exception
 {
     public int Code { get; }
@@ -44,5 +68,7 @@ public class WowStatsException : Exception
 }
 
 public sealed class ConfigException(string message) : WowStatsException(message, 4);
-public sealed class CharacterNotFoundException(string message) : WowStatsException(message, 2);
+public class NotFoundException(string message) : WowStatsException(message, 2);
+public sealed class CharacterNotFoundException(string message) : NotFoundException(message);
+public sealed class GuildNotFoundException(string message) : NotFoundException(message);
 public sealed class UpstreamException(string message) : WowStatsException(message, 3);

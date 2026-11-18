@@ -36,8 +36,16 @@ class ConfigError(WowStatsError):
     code = 4
 
 
-class CharacterNotFound(WowStatsError):
+class NotFound(WowStatsError):
     code = 2
+
+
+class CharacterNotFound(NotFound):
+    pass
+
+
+class GuildNotFound(NotFound):
+    pass
 
 
 class UpstreamError(WowStatsError):
@@ -236,19 +244,68 @@ class ForeverClient:
         bad = set(sections) - set(ALL_SECTIONS)
         if bad:
             raise ConfigError(f"Neznama sekce: {', '.join(sorted(bad))} (platne: {', '.join(ALL_SECTIONS)})")
-        ttl = self.ttl if ttl is None else ttl
         cf = self.cache_dir / f"char-{self.region}-{slug}-{'+'.join(secs) or 'summary'}.json"
+        return self._with_cache(cf, ttl, refresh, lambda: self._fetch(slug, secs))
+
+    def get_guild(self, name: str, *, ttl: int | None = None, refresh: bool = False) -> dict:
+        """Vrati dict s guildou a seznamem clenu (serazeno: rank, level sestupne, jmeno).
+        `name` je slug nebo nazev guildy, napr. 'Nazev Guildy'."""
+        slug = slugify(name)
+        if not _SLUG_RE.match(slug):
+            raise GuildNotFound(f"Neplatny nazev guildy: {name!r}")
+        cf = self.cache_dir / f"guild-{self.region}-{slug}.json"
+        return self._with_cache(cf, ttl, refresh, lambda: self._fetch_guild(slug))
+
+    def _with_cache(self, cf: Path, ttl: int | None, refresh: bool, fetch) -> dict:
+        ttl = self.ttl if ttl is None else ttl
         cached = _read_json(cf)
         if cached and not refresh and time.time() - cached["_ts"] < ttl:
             return cached["data"]
         try:
-            data = self._fetch(slug, secs)
+            data = fetch()
         except UpstreamError:
             if cached:  # radsi stara data nez chyba
                 return {**cached["data"], "stale": True}
             raise
         _write_json(cf, {"_ts": time.time(), "data": data})
         return data
+
+    def _fetch_guild(self, slug: str) -> dict:
+        base = f"/data/wow/guild/{urllib.parse.quote(slug)}"
+        st, g = self._api(base)
+        if st == 404:
+            raise GuildNotFound(f"Guilda nenalezena: {slug}")
+        if st != 200 or not isinstance(g, dict):
+            raise UpstreamError(f"Guilda: HTTP {st}")
+        st, r = self._api(f"{base}/roster")
+        if st != 200 or not isinstance(r, dict):
+            raise UpstreamError(f"Roster: HTTP {st}")
+
+        members = []
+        for x in r.get("members", []):
+            ch = x.get("character") or {}
+            cid, rid = (ch.get("playable_class") or {}).get("id"), (ch.get("playable_race") or {}).get("id")
+            members.append({
+                "name": ch.get("name"), "surname": ch.get("surname"), "slug": ch.get("slug"),
+                "level": ch.get("level"),
+                "characterClass": self._name(f"/data/wow/playable-class/{cid}") if cid is not None else None,
+                "race": self._name(f"/data/wow/playable-race/{rid}") if rid is not None else None,
+                "faction": ((ch.get("faction") or {}).get("type") or "").title() or None,
+                "rank": x.get("rank"),
+            })
+        members.sort(key=lambda m: (99 if m["rank"] is None else m["rank"], -(m["level"] or 0), m["name"] or ""))
+
+        created = g.get("created_timestamp")
+        return {
+            "name": g.get("name") or slug, "slug": slug, "id": g.get("id"),
+            "faction": ((g.get("faction") or {}).get("type") or "").title() or None,
+            "memberCount": g.get("member_count", len(members)),
+            "achievementPoints": g.get("achievement_points"),
+            "createdAt": datetime.fromtimestamp(created / 1000, timezone.utc).isoformat() if created else None,
+            "ruleset": self._name(f"/data/wow/ruleset/{g['ruleset']['id']}", "dynamic") if g.get("ruleset") else None,
+            "members": members,
+            "fetchedAt": datetime.now(timezone.utc).isoformat(), "stale": False,
+        }
 
     def _fetch(self, slug: str, secs: tuple[str, ...]) -> dict:
         base = f"/profile/wow/character/{urllib.parse.quote(slug)}"

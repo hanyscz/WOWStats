@@ -1,12 +1,17 @@
 """Offline testy: HTTP je nahrazeno atrapou, nic se neposila na Blizzard ani Wowhead."""
+import contextlib
+import io
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import wowstats.__main__ as cli
 import wowstats.client as m
-from wowstats import CharacterNotFound, ConfigError, ForeverClient
+from wowstats import CharacterNotFound, ConfigError, ForeverClient, GuildNotFound, NotFound
 
 PROFILE = {
     "name": "Test", "surname": "Char", "level": 35, "race": {"id": 2}, "character_class": {"id": 3},
@@ -23,13 +28,25 @@ PROFESSIONS = {"primaries": [{"profession": {"id": 165, "name": "Leatherworking"
                               "tiers": [{"skill_points": 120, "max_skill_points": 150}]}], "secondaries": []}
 MEDIA = {"assets": [{"key": "avatar", "value": "https://example.test/a.jpg"},
                     {"key": "main-sd-raw", "value": "https://example.test/m.png"}]}
+GUILD = {"id": 7, "name": "Test Guild", "faction": {"type": "HORDE"}, "member_count": 3,
+         "achievement_points": 0, "created_timestamp": 1700000000000, "ruleset": {"id": 2}}
+
+
+def _member(name, level, rank):
+    return {"character": {"name": name, "surname": "X", "slug": f"{name.lower()}-x", "level": level,
+                          "playable_class": {"id": 2}, "playable_race": {"id": 5}, "faction": {"type": "HORDE"}},
+            "rank": rank}
+
+
+ROSTER = {"members": [_member("B", 10, 1), _member("A", 30, 0), _member("C", 20, 1)]}
 
 
 class Fake:
     """Atrapa m._http. items = Blizzard static (id -> nazev), wowhead = id -> nazev | None (404) | 'err'."""
 
-    def __init__(self, items=None, wowhead=None, profile_status=200):
+    def __init__(self, items=None, wowhead=None, profile_status=200, guild_status=200):
         self.items, self.wowhead, self.profile_status = items or {}, wowhead or {}, profile_status
+        self.guild_status = guild_status
         self.calls = []
 
     def count(self, part):
@@ -46,12 +63,17 @@ class Fake:
             return (200, {"name": v}) if v else (404, None)
         path = url.split("blizzard.com", 1)[1].split("?")[0]
         static = {"/data/wow/playable-race/2": "Orc", "/data/wow/playable-class/3": "Hunter",
-                  "/data/wow/ruleset/2": "Normal"}
+                  "/data/wow/ruleset/2": "Normal", "/data/wow/playable-class/2": "Paladin",
+                  "/data/wow/playable-race/5": "Undead"}
         if path in static:
             return 200, {"name": static[path]}
         if path.startswith("/data/wow/item/"):
             n = self.items.get(int(path.rsplit("/", 1)[1]))
             return (200, {"name": n}) if n else (404, None)
+        if path == "/data/wow/guild/test-guild":
+            return (200, GUILD) if self.guild_status == 200 else (self.guild_status, None)
+        if path == "/data/wow/guild/test-guild/roster":
+            return 200, ROSTER
         base = "/profile/wow/character/test-char"
         if path == base:
             return (200, PROFILE) if self.profile_status == 200 else (self.profile_status, None)
@@ -160,6 +182,55 @@ class ClientTests(unittest.TestCase):
     def test_missing_credentials(self):
         with self.assertRaises(ConfigError):
             ForeverClient(cache_dir=self.tmp).get_character("test-char")
+
+    # --- guilda ---
+    def test_guild_builds_and_sorts_members(self):
+        g = self.client().get_guild("Test Guild")
+        self.assertEqual((g["name"], g["slug"], g["id"], g["faction"], g["ruleset"]),
+                         ("Test Guild", "test-guild", 7, "Horde", "Normal"))
+        self.assertEqual((g["memberCount"], g["achievementPoints"]), (3, 0))
+        self.assertTrue(g["createdAt"].startswith("2023-11-14"))
+        # rank 0 prvni, uvnitr ranku level sestupne
+        self.assertEqual([x["name"] for x in g["members"]], ["A", "C", "B"])
+        self.assertEqual(g["members"][0], {"name": "A", "surname": "X", "slug": "a-x", "level": 30,
+                                           "characterClass": "Paladin", "race": "Undead",
+                                           "faction": "Horde", "rank": 0})
+        self.assertFalse(g["stale"])
+
+    def test_guild_is_cached_on_disk(self):
+        self.client().get_guild("test-guild")
+        n = self.fake.count("/data/wow/guild/")
+        self.client().get_guild("test-guild")  # novy "proces"
+        self.assertEqual(self.fake.count("/data/wow/guild/"), n)
+        self.client().get_guild("test-guild", refresh=True)
+        self.assertEqual(self.fake.count("/data/wow/guild/"), 2 * n)
+
+    def test_guild_not_found_and_invalid(self):
+        self.fake.guild_status = 404
+        with self.assertRaises(GuildNotFound) as cm:
+            self.client().get_guild("test-guild")
+        self.assertIsInstance(cm.exception, NotFound)
+        self.assertEqual(cm.exception.code, 2)
+        with self.assertRaises(GuildNotFound):
+            self.client().get_guild("../x")
+
+    def test_guild_stale_fallback(self):
+        self.client().get_guild("test-guild")
+        self.fake.guild_status = 500
+        self.assertTrue(self.client().get_guild("test-guild", ttl=0)["stale"])
+
+    def test_cli_guild_and_errors(self):
+        args = ["--env-file", "nonexist", "--client-id", "id123456789", "--client-secret", "s"]
+        with mock.patch.dict(os.environ, {"WOWSTATS_CACHE_DIR": str(self.tmp)}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(["guild", "Test Guild", *args]), 0)
+            self.assertEqual(json.loads(out.getvalue())["members"][0]["name"], "A")
+            self.fake.guild_status = 404
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cli.main(["guild", "test-guild", "--refresh", *args]), 2)
+            self.assertEqual(json.loads(err.getvalue())["code"], 2)
 
 
 class HelperTests(unittest.TestCase):

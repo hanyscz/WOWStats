@@ -50,24 +50,83 @@ public sealed partial class ForeverClient : IDisposable
         if (!SlugRe().IsMatch(slug)) throw new CharacterNotFoundException($"Neplatné jméno postavy: '{name}'");
 
         var file = Path.Combine(_cache, $"cs-char-{_o.Region}-{slug}-{(int)sections}.json");
-        var cached = ReadJson<CacheEntry>(file);
-        if (cached is not null && !refresh &&
-            DateTimeOffset.UtcNow.ToUnixTimeSeconds() - cached.Ts < (ttl ?? _o.Ttl).TotalSeconds)
-            return cached.Data;
+        return await CachedAsync(file, ttl, refresh, () => FetchAsync(slug, sections, ct), c => c with { Stale = true });
+    }
 
-        Character data;
-        try { data = await FetchAsync(slug, sections, ct); }
-        catch (UpstreamException) when (cached is not null)
-        {
-            return cached.Data with { Stale = true }; // radši stará data než chyba
-        }
-        WriteJson(file, new CacheEntry(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), data));
-        return data;
+    /// <param name="name">Slug nebo název guildy, např. "Nazev Guildy".</param>
+    public async Task<Guild> GetGuildAsync(string name, TimeSpan? ttl = null, bool refresh = false,
+        CancellationToken ct = default)
+    {
+        var slug = name.Trim().ToLowerInvariant().Replace(' ', '-');
+        if (!SlugRe().IsMatch(slug)) throw new GuildNotFoundException($"Neplatný název guildy: '{name}'");
+        var file = Path.Combine(_cache, $"cs-guild-{_o.Region}-{slug}.json");
+        return await CachedAsync(file, ttl, refresh, () => FetchGuildAsync(slug, ct), g => g with { Stale = true });
     }
 
     // ---------- interní ----------
 
-    private sealed record CacheEntry(double Ts, Character Data);
+    private sealed record CacheEntry<T>(double Ts, T Data);
+
+    private async Task<T> CachedAsync<T>(string file, TimeSpan? ttl, bool refresh, Func<Task<T>> fetch,
+        Func<T, T> markStale) where T : class
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var cached = ReadJson<CacheEntry<T>>(file);
+        if (cached is not null && !refresh && now - cached.Ts < (ttl ?? _o.Ttl).TotalSeconds)
+            return cached.Data;
+
+        T data;
+        try { data = await fetch(); }
+        catch (UpstreamException) when (cached is not null)
+        {
+            return markStale(cached.Data); // radši stará data než chyba
+        }
+        WriteJson(file, new CacheEntry<T>(now, data));
+        return data;
+    }
+
+    private async Task<Guild> FetchGuildAsync(string slug, CancellationToken ct)
+    {
+        var baseP = $"/data/wow/guild/{Uri.EscapeDataString(slug)}";
+        var (st, g) = await ApiAsync(baseP, "profile", null, ct);
+        if (st == 404) throw new GuildNotFoundException($"Guilda nenalezena: {slug}");
+        if (st != 200 || g is not { } guild) throw new UpstreamException($"Guilda: HTTP {st}");
+        var (st2, r) = await ApiAsync($"{baseP}/roster", "profile", null, ct);
+        if (st2 != 200 || r is not { } roster) throw new UpstreamException($"Roster: HTTP {st2}");
+
+        var members = new List<GuildMember>();
+        if (roster.Path("members") is { ValueKind: JsonValueKind.Array } arr)
+            foreach (var x in arr.EnumerateArray())
+            {
+                if (x.Path("character") is not { } c) continue;
+                var cid = c.Path("playable_class", "id")?.GetInt32();
+                var rid = c.Path("playable_race", "id")?.GetInt32();
+                members.Add(new GuildMember(
+                    c.Path("name")?.GetString(), c.Path("surname")?.GetString(), c.Path("slug")?.GetString(),
+                    c.Path("level")?.GetInt32(),
+                    cid is { } a ? await NameAsync($"/data/wow/playable-class/{a}", "static", ct) : null,
+                    rid is { } b ? await NameAsync($"/data/wow/playable-race/{b}", "static", ct) : null,
+                    c.Path("faction", "type")?.GetString() is { Length: > 0 } f ? Title(f) : null,
+                    x.Path("rank")?.GetInt32()));
+            }
+        var sorted = members.OrderBy(m => m.Rank ?? 99).ThenByDescending(m => m.Level ?? 0)
+            .ThenBy(m => m.Name, StringComparer.Ordinal).ToList();
+
+        long? created = guild.Path("created_timestamp")?.GetInt64();
+        var rulesetId = guild.Path("ruleset", "id")?.GetInt32();
+        return new Guild(
+            Name: guild.Path("name")?.GetString() ?? slug,
+            Slug: slug,
+            Id: guild.Path("id")?.GetInt32() ?? 0,
+            Faction: guild.Path("faction", "type")?.GetString() is { Length: > 0 } gf ? Title(gf) : null,
+            MemberCount: guild.Path("member_count")?.GetInt32() ?? sorted.Count,
+            AchievementPoints: guild.Path("achievement_points")?.GetInt32() ?? 0,
+            CreatedAt: created is { } cr ? DateTimeOffset.FromUnixTimeMilliseconds(cr) : null,
+            Ruleset: rulesetId is { } rid2 ? await NameAsync($"/data/wow/ruleset/{rid2}", "dynamic", ct) : null,
+            Members: sorted,
+            FetchedAt: DateTimeOffset.UtcNow,
+            Stale: false);
+    }
 
     private async Task<Character> FetchAsync(string slug, CharacterSections secs, CancellationToken ct)
     {
