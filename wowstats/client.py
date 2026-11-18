@@ -6,6 +6,7 @@ z roznych procesu nestala zbytecne pozadavky.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -21,13 +22,24 @@ from pathlib import Path
 # Dalsi sekce jsou "na vyzadani": kazda znamena aspon jeden HTTP dotaz navic na postavu.
 DEFAULT_SECTIONS = ("stats", "gear", "professions", "media", "lifetime")
 ALL_SECTIONS = DEFAULT_SECTIONS + ("achievements", "reputations", "quests", "pvp", "hunterPets", "specializations",
-                                   "icons")
+                                   "icons", "itemDetails", "recipes", "collections", "appearance", "encounters",
+                                   "titles", "mythicKeystone")
+# Sekce bez vlastniho dokumentu: doplnuji jinou sekci (a ta se proto stahne automaticky)
+_IMPLIES = {"icons": "gear", "itemDetails": "gear", "recipes": "professions"}
+# Sekce, ktere se vraci "jak je" (bez odkazu, klice v camelCase): None = dotaz selhal, {} = API nic nevratilo
+_PASSTHROUGH = {"appearance", "titles", "mythicKeystone"}
 _SUBDOC = {"stats": "statistics", "gear": "equipment", "professions": "professions", "media": "character-media",
            "lifetime": "achievements/statistics", "achievements": "achievements", "reputations": "reputations",
            "quests": "quests", "pvp": "pvp-summary", "hunterPets": "hunter-pets",
-           "specializations": "specializations"}  # "icons" nema vlastni dokument, doplnuje gear[].iconUrl
+           "specializations": "specializations", "appearance": "appearance", "titles": "titles",
+           "mythicKeystone": "mythic-keystone-profile"}
+# "collections" (5 dokumentu) a "encounters" (2 dokumenty) se stahuji zvlast v _fetch
 # Sekce, kde API vraci nazvy jen anglicky (v jinem jazyce jsou null), proto se vzdy zada en_GB
-_EN_SECTIONS = {"lifetime", "achievements", "reputations", "quests", "pvp", "hunterPets", "specializations"}
+_EN_SECTIONS = {"lifetime", "achievements", "reputations", "quests", "pvp", "hunterPets", "specializations",
+                "collections", "appearance", "encounters", "titles", "mythicKeystone"}
+_AUCTION_KINDS = ("auctions", "commodities")
+_AUCTION_NAMES_MAX = 500  # nejvic ruznych itemu, u kterych se u aukci rozresi nazvy (kazdy neznamy = dotaz)
+_RAW_PATH_RE = re.compile(r"^/(data|profile)/wow/[\w\-./]*$")
 # Statistiky za celou dobu: id statistiky -> klic ve `lifetime.highlights` (id jsou stabilni, nazvy jen anglicky)
 _LIFETIME_KEYS = {
     60: "deaths", 1501: "deathsFromPlayers", 318: "deathsFromOppositeFaction", 114: "deathsFalling",
@@ -133,6 +145,31 @@ def _build_lifetime(doc: dict) -> dict | None:
     return {"highlights": hl, "all": rows}
 
 
+def _camel_key(k):
+    return re.sub(r"_([a-z0-9])", lambda m: m.group(1).upper(), k) if isinstance(k, str) else k
+
+
+def _tidy(obj, drop=()):
+    """Odpoved API bez odkazu (`_links`, `key: {href}`, `{href}`) a s klici v camelCase. Hodnoty zustavaji
+    beze zmeny, nic se neztraci. `drop` = dalsi klice na nejvyssi urovni, ktere se vynechaji (napr. 'character')."""
+    def rec(x, top=False):
+        if isinstance(x, dict):
+            out = {}
+            for k, v in x.items():
+                if k == "_links" or (top and k in drop):
+                    continue
+                if k == "key" and isinstance(v, dict) and "href" in v:
+                    continue
+                if isinstance(v, dict) and set(v) == {"href"}:
+                    continue
+                out[_camel_key(k)] = rec(v)
+            return out
+        if isinstance(x, list):
+            return [rec(v) for v in x]
+        return x
+    return rec(obj, True)
+
+
 def _iso_ms(ts) -> str | None:
     if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts:
         return datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
@@ -150,12 +187,15 @@ def _build_achievements(doc: dict) -> dict | None:
             ach = a.get("achievement") or {}
             completed.append({"id": ach.get("id", a.get("id")), "name": ach.get("name"), "completedAt": at})
     completed.sort(key=lambda x: x["completedAt"])
+    in_progress = [{"id": (a.get("achievement") or {}).get("id", a.get("id")),
+                    "name": (a.get("achievement") or {}).get("name"), "criteria": _tidy(a.get("criteria") or {})}
+                   for a in doc.get("achievements") or [] if not _iso_ms(a.get("completed_timestamp"))]
     recent = [{"id": (e.get("achievement") or {}).get("id"), "name": (e.get("achievement") or {}).get("name"),
                "at": _iso_ms(e.get("timestamp"))} for e in doc.get("recent_events") or []]
     cats = [{"id": (c.get("category") or {}).get("id"), "name": (c.get("category") or {}).get("name"),
              "quantity": c.get("quantity"), "points": c.get("points")} for c in doc.get("category_progress") or []]
     return {"total": doc.get("total_quantity", len(completed)), "points": doc.get("total_points", 0),
-            "completed": completed, "recent": recent, "categories": cats}
+            "completed": completed, "inProgress": in_progress, "recent": recent, "categories": cats}
 
 
 def _build_reputations(doc: dict) -> list | None:
@@ -219,6 +259,48 @@ def _build_specializations(doc: dict) -> list | None:
                           "points": s.get("spent_points", sum(t["rank"] or 0 for t in talents)), "talents": talents})
         groups.append({"active": bool(g.get("is_active")), "specializations": specs})
     return groups
+
+
+def _build_collections(docs: dict) -> dict | None:
+    """docs: {mounts, pets, toys, heirlooms, transmogs}, hodnota None = dotaz selhal. Prazdna sbirka = []."""
+    if all(v is None for v in docs.values()):
+        return None
+    ref = lambda x, k: {"id": (x.get(k) or {}).get("id"), "name": (x.get(k) or {}).get("name")}
+    out: dict = {"mounts": None, "pets": None, "unlockedBattlePetSlots": None, "toys": None, "heirlooms": None,
+                 "transmogs": None}
+    if docs.get("mounts") is not None:
+        out["mounts"] = [{**ref(m, "mount"), "usable": bool(m.get("is_useable"))}
+                         for m in docs["mounts"].get("mounts") or []]
+    if docs.get("pets") is not None:
+        out["pets"] = [_tidy(p) for p in docs["pets"].get("pets") or []]  # kompletni zaznam (druh, level, kvalita, staty)
+        out["unlockedBattlePetSlots"] = docs["pets"].get("unlocked_battle_pet_slots")
+    if docs.get("toys") is not None:
+        out["toys"] = [ref(t, "toy") for t in docs["toys"].get("toys") or []]
+    if docs.get("heirlooms") is not None:
+        out["heirlooms"] = _tidy(docs["heirlooms"].get("heirlooms") or [])
+    if docs.get("transmogs") is not None:
+        out["transmogs"] = [{"slot": (s.get("slot") or {}).get("type"),
+                             "appearanceIds": [a.get("id") for a in s.get("appearances") or []]}
+                            for s in docs["transmogs"].get("slots") or []]
+    return out
+
+
+def _norm_auction(a: dict, commodity: bool) -> dict:
+    item = a.get("item") or {}
+    if commodity:
+        return {"id": a.get("id"), "itemId": item.get("id"), "quantity": a.get("quantity"),
+                "unitPrice": a.get("unit_price"), "timeLeft": a.get("time_left")}
+    r = {"id": a.get("id"), "itemId": item.get("id"), "quantity": a.get("quantity"), "buyout": a.get("buyout"),
+         "timeLeft": a.get("time_left")}
+    if "bid" in a:
+        r["bid"] = a["bid"]
+    if "context" in item:
+        r["context"] = item["context"]
+    if "modifiers" in item:
+        r["modifiers"] = [{"type": m.get("type"), "value": m.get("value")} for m in item["modifiers"] or []]
+    if "bonus_lists" in item:
+        r["bonusLists"] = list(item["bonus_lists"] or [])
+    return r
 
 
 def _http(url: str, token: str | None = None, data: bytes | None = None, basic: str | None = None):
@@ -298,10 +380,17 @@ class ForeverClient:
         _write_json(tf, {"token": j["access_token"], "exp": time.time() + j.get("expires_in", 3600)})
         return j["access_token"]
 
-    def _api(self, path: str, kind: str = "profile", locale: str | None = None):
+    def _api(self, path: str, kind: str = "profile", locale: str | None = None, params: dict | None = None):
         url = (f"https://{self.region}.api.blizzard.com{path}"
                f"?namespace={kind}-forever-{self.region}&locale={locale or self.locale}")
+        if params:
+            url += "&" + urllib.parse.urlencode(sorted(params.items()))
         return _http(url, self._token())
+
+    def _doc(self, path: str, kind: str = "profile", locale: str | None = "en_GB"):
+        """Dokument jako dict, nebo None, kdyz dotaz selhal (404 i jina chyba)."""
+        st, b = self._api(path, kind, locale)
+        return b if st == 200 and isinstance(b, dict) else None
 
     # --- jmena ze static dat (cs_CZ vraci 200 s prazdnym jmenem -> fallback en_GB) ---
     def _name(self, path: str, kind: str = "static"):
@@ -405,8 +494,7 @@ class ForeverClient:
         bad = want - set(ALL_SECTIONS)
         if bad:
             raise ConfigError(f"Neznama sekce: {', '.join(sorted(bad))} (platne: {', '.join(ALL_SECTIONS)})")
-        if "icons" in want:
-            want.add("gear")
+        want |= {_IMPLIES[s] for s in want if s in _IMPLIES}  # icons/itemDetails -> gear, recipes -> professions
         secs = tuple(s for s in ALL_SECTIONS if s in want)
         cf = self.cache_dir / f"char-{self.region}-{slug}-{'+'.join(secs) or 'summary'}.json"
         return self._with_cache(cf, ttl, refresh, lambda: self._fetch(slug, secs))
@@ -433,6 +521,119 @@ class ForeverClient:
             raise
         _write_json(cf, {"_ts": time.time(), "data": data})
         return data
+
+    # --- libovolny endpoint Blizzard API (cokoliv, co knihovna nezabaluje) ---
+    def raw(self, path: str, *, kind: str = "static", params: dict | None = None, locale: str | None = None,
+            ttl: int | None = None, refresh: bool = False, clean: bool = False):
+        """Vrati JSON libovolneho endpointu tak, jak prisel (cesta zacina /data/wow/ nebo /profile/wow/).
+
+        `kind` je namespace: "static" (vychozi), "dynamic" nebo "profile". `params` jsou dalsi parametry dotazu
+        (napr. hledani). `clean=True` odstrani odkazy a prepise klice do camelCase. 404 -> NotFound, jina chyba
+        -> UpstreamError. Vysledek se cachuje na disk (`ttl`, `refresh` jako jinde)."""
+        if kind not in ("profile", "static", "dynamic"):
+            raise ConfigError(f"Neplatny kind {kind!r} (platne: profile, static, dynamic)")
+        if not _RAW_PATH_RE.match(path) or ".." in path:
+            raise ConfigError(f"Neplatna cesta {path!r}: musi zacinat /data/wow/ nebo /profile/wow/")
+        qs = urllib.parse.urlencode(sorted((params or {}).items()))
+        key = hashlib.sha1(f"{self.region}|{kind}|{path}|{qs}|{locale or self.locale}".encode()).hexdigest()[:20]
+
+        def fetch():
+            st, b = self._api(path, kind, locale, params)
+            if st == 404:
+                raise NotFound(f"Nenalezeno: {path}")
+            if st != 200 or not isinstance(b, (dict, list)):
+                raise UpstreamError(f"{path}: HTTP {st}")
+            return {"doc": b}
+
+        doc = self._with_cache(self.cache_dir / f"raw-{key}.json", ttl, refresh, fetch)["doc"]
+        return _tidy(doc) if clean else doc
+
+    # --- rulesety a aukce ---
+    def get_rulesets(self, *, ttl: int | None = None, refresh: bool = False) -> list[dict]:
+        """Rulesety (ve Forever misto realmu): [{id, name}], napr. 1 PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP."""
+        return self._with_cache(self.cache_dir / f"rulesets-{self.region}.json", ttl, refresh,
+                                self._fetch_rulesets)["rulesets"]
+
+    def _fetch_rulesets(self) -> dict:
+        st, b = self._api("/data/wow/ruleset/index", "dynamic", "en_GB")
+        if st != 200 or not isinstance(b, dict):
+            raise UpstreamError(f"Rulesety: HTTP {st}")
+        ids = sorted(r["id"] for r in b.get("rulesets") or [] if "id" in r)
+        return {"rulesets": [{"id": i, "name": self._name(f"/data/wow/ruleset/{i}", "dynamic")} for i in ids]}
+
+    def _resolve_ruleset(self, ruleset) -> dict:
+        rs = self.get_rulesets()
+        if not rs:
+            raise UpstreamError("API nevratilo zadne rulesety")
+        if ruleset is None:  # data aukci jsou u vsech rulesetu stejna, "Normal" je rozumny vychozi
+            return next((r for r in rs if (r["name"] or "").lower() == "normal"), rs[0])
+        if isinstance(ruleset, int) or str(ruleset).strip().isdigit():
+            hit = next((r for r in rs if r["id"] == int(ruleset)), None)
+        else:
+            hit = next((r for r in rs if (r["name"] or "").lower() == str(ruleset).strip().lower()), None)
+        if hit is None:
+            valid = ", ".join(f"{r['id']}={r['name']}" for r in rs)
+            raise ConfigError(f"Neznamy ruleset {ruleset!r} (platne: {valid})")
+        return hit
+
+    def get_auction_houses(self, ruleset=None, *, ttl: int | None = None, refresh: bool = False) -> list[dict]:
+        """Aukcni domy: [{id, name}]. `ruleset` je id nebo nazev (vychozi Normal)."""
+        rs = self._resolve_ruleset(ruleset)
+
+        def fetch():
+            st, b = self._api(f"/data/wow/ruleset/{rs['id']}/auctions/", "dynamic", "en_GB")  # lomitko na konci je nutne
+            if st != 200 or not isinstance(b, dict):
+                raise UpstreamError(f"Aukcni domy: HTTP {st}")
+            return {"houses": [{"id": a.get("id"), "name": a.get("name")} for a in b.get("auctions") or []]}
+
+        return self._with_cache(self.cache_dir / f"auchouses-{self.region}-{rs['id']}.json", ttl, refresh, fetch)["houses"]
+
+    def get_auctions(self, house, *, ruleset=None, kind: str = "auctions", item_ids=None, limit: int | None = None,
+                     names: bool = False, ttl: int | None = None, refresh: bool = False) -> dict:
+        """Nabidky v aukcnim dome. `house` je id domu (viz get_auction_houses).
+
+        `kind`: "auctions" (jednotlive nabidky: buyout, bid) nebo "commodities" (hromadne zbozi: unitPrice).
+        Ceny jsou v copperu. Cely dum ma i stovky tisic nabidek (desitky MB), proto se cachuje na disk a `item_ids`
+        (jen tyto itemy) a `limit` se aplikuji az na cachovana data. `names=True` doplni `itemName` (max. 500 ruznych
+        itemu, kazdy neznamy je dotaz, pak je v cache). Pozor: data jsou u vsech rulesetu stejna (zvlastnost API)."""
+        if kind not in _AUCTION_KINDS:
+            raise ConfigError(f"Neplatny kind {kind!r} (platne: {', '.join(_AUCTION_KINDS)})")
+        try:
+            hid = int(house)
+        except (TypeError, ValueError):
+            raise ConfigError("house musi byt cislo (id aukcniho domu, viz get_auction_houses)") from None
+        rs = self._resolve_ruleset(ruleset)
+        full = self._with_cache(self.cache_dir / f"auc-{self.region}-{rs['id']}-{hid}-{kind}.json", ttl, refresh,
+                                lambda: self._fetch_auctions(rs, hid, kind))
+        rows = full["auctions"]
+        if item_ids is not None:
+            want = {int(i) for i in item_ids}
+            rows = [a for a in rows if a["itemId"] in want]
+        matched = len(rows)
+        if limit is not None:
+            rows = rows[:max(0, int(limit))]
+        if names:
+            ids = {a["itemId"] for a in rows}
+            if len(ids) > _AUCTION_NAMES_MAX:
+                raise ConfigError(f"names=True u {len(ids)} ruznych itemu je moc (max {_AUCTION_NAMES_MAX}); "
+                                  "zuz vyber pres item_ids nebo limit")
+            nm = {i: self._item_name(i) for i in ids}
+            self._flush_items()
+            rows = [{**a, "itemName": nm.get(a["itemId"])} for a in rows]
+        return {**{k: v for k, v in full.items() if k != "auctions"}, "matched": matched, "returned": len(rows),
+                "auctions": rows}
+
+    def _fetch_auctions(self, rs: dict, hid: int, kind: str) -> dict:
+        path = f"/data/wow/ruleset/{rs['id']}/auctions/{hid}" + ("/commodities" if kind == "commodities" else "")
+        st, b = self._api(path, "dynamic", "en_GB")
+        if st == 404:
+            raise NotFound(f"Aukcni dum {hid} nenalezen (ruleset {rs['name']})")
+        if st != 200 or not isinstance(b, dict):
+            raise UpstreamError(f"Aukce: HTTP {st}")
+        rows = [_norm_auction(a, kind == "commodities") for a in b.get("auctions") or []]
+        name = b.get("name") or next((h["name"] for h in self.get_auction_houses(rs["id"]) if h["id"] == hid), None)
+        return {"house": {"id": hid, "name": name}, "ruleset": rs, "kind": kind, "total": len(rows),
+                "auctions": rows, "fetchedAt": datetime.now(timezone.utc).isoformat(), "stale": False}
 
     def _fetch_guild(self, slug: str) -> dict:
         base = f"/data/wow/guild/{urllib.parse.quote(slug)}"
@@ -480,14 +681,21 @@ class ForeverClient:
             raise UpstreamError(f"Profil: HTTP {st}")
         sub = {}
         for s in secs:
-            if s not in _SUBDOC:  # "icons" nema vlastni dokument
+            if s not in _SUBDOC:  # sekce bez vlastniho dokumentu (icons, itemDetails, recipes, collections, encounters)
                 continue
-            # u techto sekci vraci API nazvy jen anglicky, jinak jsou null
-            st2, b = self._api(f"{base}/{_SUBDOC[s]}", locale="en_GB" if s in _EN_SECTIONS else None)
-            sub[s] = b if st2 == 200 and isinstance(b, dict) else {}
+            # u techto sekci vraci API nazvy jen anglicky, jinak jsou null (recepty jsou v profesich)
+            en = (s in _EN_SECTIONS or (s == "professions" and "recipes" in secs)
+                  or (s == "gear" and "itemDetails" in secs))
+            st2, b = self._api(f"{base}/{_SUBDOC[s]}", locale="en_GB" if en else None)
+            sub[s] = b if st2 == 200 and isinstance(b, dict) else (None if s in _PASSTHROUGH else {})
         if "quests" in sub:
             st3, done = self._api(f"{base}/quests/completed", locale="en_GB")
             sub["quests_completed"] = done if st3 == 200 and isinstance(done, dict) else {}
+        if "collections" in secs:
+            sub["collections"] = {n: self._doc(f"{base}/collections/{n}")
+                                  for n in ("mounts", "pets", "toys", "heirlooms", "transmogs")}
+        if "encounters" in secs:
+            sub["encounters"] = {n: self._doc(f"{base}/encounters/{n}") for n in ("dungeons", "raids")}
 
         login = p.get("last_login_timestamp")
         out = {
@@ -499,6 +707,10 @@ class ForeverClient:
             "ruleset": self._name(f"/data/wow/ruleset/{p['ruleset']['id']}", "dynamic") if p.get("ruleset") else None,
             "itemLevel": p.get("equipped_item_level"),
             "lastLogin": datetime.fromtimestamp(login / 1000, timezone.utc).isoformat() if login else None,
+            "experience": p.get("experience"),
+            "gender": ((p.get("gender") or {}).get("type") or "").title() or None,
+            "achievementPoints": p.get("achievement_points"),
+            "averageItemLevel": p.get("average_item_level"),
         }
         if "stats" in sub:
             out["stats"] = {k: n for k, v in sub["stats"].items()
@@ -514,18 +726,28 @@ class ForeverClient:
                 for g in out["gear"]:
                     g["iconUrl"] = self._item_icon(g["itemId"])
                 self._flush_icons()
+            if "itemDetails" in secs:  # cely zaznam itemu z API (bez odkazu, camelCase), nic se nezahazuje
+                for g, it in zip(out["gear"], sub["gear"].get("equipped_items", [])):
+                    g["details"] = _tidy(it)
             self._flush_items()
         if "professions" in sub:
             out["professions"] = []
             for grp in ("primaries", "secondaries"):
                 for pr in sub["professions"].get(grp, []):
                     tiers = pr.get("tiers", [])
-                    out["professions"].append({
+                    entry = {
                         "name": pr["profession"].get("name") or self._name(f"/data/wow/profession/{pr['profession']['id']}"),
                         "primary": grp == "primaries",
                         "skill": sum(t.get("skill_points", 0) for t in tiers),
                         "maxSkill": sum(t.get("max_skill_points", 0) for t in tiers),
-                    })
+                    }
+                    if "recipes" in secs:
+                        entry["tiers"] = [{"id": (t.get("tier") or {}).get("id"), "name": (t.get("tier") or {}).get("name"),
+                                           "skill": t.get("skill_points", 0), "maxSkill": t.get("max_skill_points", 0)}
+                                          for t in tiers]
+                        entry["recipes"] = [{"id": r.get("id"), "name": r.get("name"), "tier": (t.get("tier") or {}).get("name")}
+                                            for t in tiers for r in t.get("known_recipes") or []]
+                    out["professions"].append(entry)
         if "lifetime" in sub:
             out["lifetime"] = _build_lifetime(sub["lifetime"])
         if "achievements" in sub:
@@ -540,6 +762,19 @@ class ForeverClient:
             out["hunterPets"] = _build_hunter_pets(sub["hunterPets"])
         if "specializations" in sub:
             out["specializations"] = _build_specializations(sub["specializations"])
+        if "collections" in sub:
+            out["collections"] = _build_collections(sub["collections"])
+        if "appearance" in sub:
+            out["appearance"] = None if sub["appearance"] is None else _tidy(sub["appearance"], drop=("character",))
+        if "titles" in sub:
+            out["titles"] = None if sub["titles"] is None else _tidy(sub["titles"], drop=("character",))
+        if "mythicKeystone" in sub:
+            out["mythicKeystone"] = (None if sub["mythicKeystone"] is None
+                                     else _tidy(sub["mythicKeystone"], drop=("character",)))
+        if "encounters" in sub:
+            d = sub["encounters"]
+            out["encounters"] = (None if all(v is None for v in d.values())
+                                 else {n: None if v is None else _tidy(v, drop=("character",)) for n, v in d.items()})
         if "media" in sub:
             a = {x["key"]: x["value"] for x in sub["media"].get("assets", [])}
             out["avatarUrl"], out["renderUrl"] = a.get("avatar"), a.get("main-sd-raw")

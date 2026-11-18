@@ -16,16 +16,45 @@ from wowstats import CharacterNotFound, ConfigError, ForeverClient, GuildNotFoun
 PROFILE = {
     "name": "Test", "surname": "Char", "level": 35, "race": {"id": 2}, "character_class": {"id": 3},
     "faction": {"type": "HORDE"}, "guild": {"name": "Guild"}, "ruleset": {"id": 2},
-    "equipped_item_level": 26, "last_login_timestamp": 1700000000000,
+    "equipped_item_level": 26, "last_login_timestamp": 1700000000000, "experience": 60503,
+    "gender": {"type": "MALE", "name": "Male"}, "achievement_points": 10, "average_item_level": 25,
 }
 EQUIPMENT = {"equipped_items": [
-    {"item": {"id": 1}, "slot": {"type": "HEAD"}, "quality": {"type": "RARE"}, "level": {"value": 30}, "name": None},
+    {"item": {"id": 1, "key": {"href": "http://x/item/1"}}, "slot": {"type": "HEAD"}, "quality": {"type": "RARE"},
+     "level": {"value": 30}, "name": None, "media": {"key": {"href": "http://x/media/1"}, "id": 1},
+     "binding": {"type": "ON_ACQUIRE", "name": "Binds when picked up"},
+     "stats": [{"type": {"type": "AGILITY", "name": "Agility"}, "value": 3, "is_hidden": False,
+                "display": {"display_string": "+3 Agility"}}]},
     {"item": {"id": 2}, "slot": {"type": "FINGER_1"}, "quality": {"type": "UNCOMMON"}, "level": {"value": 20}, "name": None},
 ]}
 STATS = {"_links": {}, "character": {}, "attack_power": 262, "strength": {"base": 40, "effective": 47},
          "melee_crit": {"value": 3.5904002}}
 PROFESSIONS = {"primaries": [{"profession": {"id": 165, "name": "Leatherworking"},
-                              "tiers": [{"skill_points": 120, "max_skill_points": 150}]}], "secondaries": []}
+                              "tiers": [{"tier": {"id": 2945, "name": "Leatherworking"}, "skill_points": 120,
+                                         "max_skill_points": 150,
+                                         "known_recipes": [{"key": {"href": "x"}, "id": 1353, "name": "Boots"},
+                                                           {"id": 4419, "name": "Belt"}]}]}], "secondaries": []}
+COLL_MOUNTS = {"_links": {}, "mounts": [{"mount": {"key": {"href": "x"}, "name": "Horse", "id": 3111}, "is_useable": True}]}
+COLL_PETS = {"pets": [{"species": {"name": "Zergling", "id": 5160}, "level": 1,
+                       "quality": {"type": "UNCOMMON", "name": "Uncommon"}, "stats": {"breed_id": 0, "health": 100},
+                       "creature_display": {"id": 9}, "id": 77}], "unlocked_battle_pet_slots": 0}
+COLL_TOYS = {"toys": [{"toy": {"name": "Windwell", "id": 1761}}]}
+COLL_HEIRLOOMS = {"_links": {}}
+COLL_TRANSMOGS = {"slots": [{"slot": {"type": "HEAD", "name": "Head"},
+                             "appearances": [{"key": {"href": "x"}, "id": 29124}, {"id": 64412}]}]}
+APPEARANCE = {"_links": {}, "character": {"name": "X"}, "playable_race": {"key": {"href": "x"}, "name": "Orc", "id": 2},
+              "customizations": [{"option": {"name": "Skin Color", "id": 63}, "choice": {"id": 984, "display_order": 0}}]}
+TITLES = {"_links": {}, "character": {"name": "X"}}
+MYTHIC = {"current_period": {"period": {"key": {"href": "x"}, "id": 1090}}, "character": {"name": "X"}}
+ENC_DUNGEONS = {"_links": {}}
+ENC_RAIDS = {"_links": {}, "character": {"name": "X"}, "some_field": {"inner_value": 1}}
+AUCTIONS = [
+    {"id": 1, "item": {"id": 10}, "buyout": 100, "quantity": 1, "time_left": "LONG"},
+    {"id": 2, "item": {"id": 11, "context": 1, "modifiers": [{"type": 28, "value": 5}], "bonus_lists": [1, 2]},
+     "buyout": 200, "bid": 150, "quantity": 2, "time_left": "SHORT"},
+    {"id": 3, "item": {"id": 10}, "buyout": 90, "quantity": 5, "time_left": "MEDIUM"},
+]
+COMMODITIES = [{"id": 5, "item": {"id": 20}, "quantity": 17, "unit_price": 20, "time_left": "LONG"}]
 LIFETIME = {"categories": [
     {"name": "Deaths", "statistics": [{"id": 60, "name": "Total deaths", "quantity": 33.0}], "sub_categories": [
         {"name": "World", "statistics": [{"id": 114, "name": "Deaths from falling", "quantity": 1.0}]},
@@ -83,6 +112,7 @@ class Fake:
         self.guild_status = guild_status
         self.lifetime_ok = True
         self.hunter_ok = True
+        self.fail = set()                                 # koncovky cest, u kterych se simuluje HTTP 500
         self.icons = {1: "https://example.test/i1.jpg"}  # id itemu -> url ikony (ostatni = 404)
         self.icon_errors = set()                          # id itemu, u kterych se simuluje sitova chyba
         self.calls = []
@@ -100,8 +130,10 @@ class Fake:
                 return -1, "boom"
             return (200, {"name": v}) if v else (404, None)
         path = url.split("blizzard.com", 1)[1].split("?")[0]
+        if any(path.endswith(s) for s in self.fail):
+            return 500, None
         static = {"/data/wow/playable-race/2": "Orc", "/data/wow/playable-class/3": "Hunter",
-                  "/data/wow/ruleset/2": "Normal", "/data/wow/playable-class/2": "Paladin",
+                  "/data/wow/ruleset/2": "Normal", "/data/wow/ruleset/1": "PvP", "/data/wow/playable-class/2": "Paladin",
                   "/data/wow/playable-race/5": "Undead"}
         if path in static:
             return 200, {"name": static[path]}
@@ -114,6 +146,18 @@ class Fake:
         if path.startswith("/data/wow/item/"):
             n = self.items.get(int(path.rsplit("/", 1)[1]))
             return (200, {"name": n}) if n else (404, None)
+        if path == "/data/wow/ruleset/index":
+            return 200, {"rulesets": [{"id": 2}, {"id": 1}]}
+        if path == "/data/wow/ruleset/2/auctions/":
+            return 200, {"auctions": [{"key": {"href": "x"}, "name": "Alliance Auction House", "id": 110},
+                                      {"name": "Horde Auction House", "id": 113}]}
+        if path == "/data/wow/ruleset/2/auctions/110":
+            return 200, {"id": 110, "name": "Alliance Auction House", "auctions": AUCTIONS, "commodities": {"href": "x"}}
+        if path == "/data/wow/ruleset/2/auctions/110/commodities":
+            return 200, {"auctions": COMMODITIES}
+        if path == "/data/wow/achievement/855":
+            return 200, {"_links": {"self": {"href": "x"}}, "id": 855, "name": "Explore", "reward_description": "r",
+                         "category": {"key": {"href": "y"}, "name": "Exploration", "id": 3}}
         if path == "/data/wow/guild/test-guild":
             return (200, GUILD) if self.guild_status == 200 else (self.guild_status, None)
         if path == "/data/wow/guild/test-guild/roster":
@@ -124,7 +168,11 @@ class Fake:
         sub = {"/equipment": EQUIPMENT, "/statistics": STATS, "/professions": PROFESSIONS,
                "/character-media": MEDIA, "/achievements/statistics": LIFETIME, "/achievements": ACHIEVEMENTS,
                "/reputations": REPUTATIONS, "/quests": QUESTS_IN, "/quests/completed": QUESTS_DONE,
-               "/pvp-summary": PVP, "/hunter-pets": PETS, "/specializations": SPECS}
+               "/pvp-summary": PVP, "/hunter-pets": PETS, "/specializations": SPECS,
+               "/collections/mounts": COLL_MOUNTS, "/collections/pets": COLL_PETS, "/collections/toys": COLL_TOYS,
+               "/collections/heirlooms": COLL_HEIRLOOMS, "/collections/transmogs": COLL_TRANSMOGS,
+               "/appearance": APPEARANCE, "/titles": TITLES, "/mythic-keystone-profile": MYTHIC,
+               "/encounters/dungeons": ENC_DUNGEONS, "/encounters/raids": ENC_RAIDS}
         if path.endswith("/hunter-pets") and not self.hunter_ok:
             return 404, None
         if path.endswith("/achievements/statistics") and not self.lifetime_ok:
@@ -271,6 +319,159 @@ class ClientTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 self.assertEqual(cli.main(["character", "test-char", "--sections", "all", *args]), 0)
         self.assertIn("achievements", json.loads(out.getvalue()))
+
+    # --- profil, detaily itemu, recepty, sbirky, vzhled a dalsi ---
+    def test_profile_extras_in_default_output(self):
+        c = self.client().get_character("test-char")
+        self.assertEqual((c["experience"], c["gender"], c["achievementPoints"], c["averageItemLevel"]),
+                         (60503, "Male", 10, 25))
+
+    def test_item_details_are_complete_and_tidy(self):
+        c = self.client(locale="cs_CZ").get_character("test-char", sections=["itemDetails"])  # automaticky zahrne gear
+        self.assertIn("locale=en_GB", next(u for u in self.fake.calls if "/equipment?" in u))  # texty jen anglicky
+        d = c["gear"][0]["details"]
+        self.assertEqual(d["binding"], {"type": "ON_ACQUIRE", "name": "Binds when picked up"})
+        self.assertEqual(d["stats"][0], {"type": {"type": "AGILITY", "name": "Agility"}, "value": 3, "isHidden": False,
+                                         "display": {"displayString": "+3 Agility"}})
+        self.assertEqual((d["item"], d["media"]), ({"id": 1}, {"id": 1}))  # odkazy odstraneny
+        self.assertEqual(d["slot"], {"type": "HEAD"})  # nic se nezahazuje, ani to, co je uz v gear
+        self.assertNotIn("iconUrl", c["gear"][0])
+
+    def test_recipes_imply_professions_and_use_english(self):
+        c = self.client(locale="cs_CZ").get_character("test-char", sections=["recipes"])
+        p = c["professions"][0]
+        self.assertEqual(p["recipes"], [{"id": 1353, "name": "Boots", "tier": "Leatherworking"},
+                                        {"id": 4419, "name": "Belt", "tier": "Leatherworking"}])
+        self.assertEqual(p["tiers"], [{"id": 2945, "name": "Leatherworking", "skill": 120, "maxSkill": 150}])
+        self.assertIn("locale=en_GB", next(u for u in self.fake.calls if "/professions?" in u))
+        self.assertNotIn("recipes", self.client().get_character("test-char", sections=["professions"],
+                                                                refresh=True)["professions"][0])
+
+    def test_collections(self):
+        c = self.client().get_character("test-char", sections=["collections"])["collections"]
+        self.assertEqual(c["mounts"], [{"id": 3111, "name": "Horse", "usable": True}])
+        self.assertEqual(c["pets"], [{"species": {"name": "Zergling", "id": 5160}, "level": 1,
+                                      "quality": {"type": "UNCOMMON", "name": "Uncommon"},
+                                      "stats": {"breedId": 0, "health": 100}, "creatureDisplay": {"id": 9}, "id": 77}])
+        self.assertEqual((c["unlockedBattlePetSlots"], c["toys"], c["heirlooms"]), (0, [{"id": 1761, "name": "Windwell"}], []))
+        self.assertEqual(c["transmogs"], [{"slot": "HEAD", "appearanceIds": [29124, 64412]}])
+
+    def test_collections_partial_failure_keeps_the_rest(self):
+        self.fake.fail = {"/collections/pets"}
+        c = self.client().get_character("test-char", sections=["collections"])["collections"]
+        self.assertIsNone(c["pets"])
+        self.assertEqual(len(c["mounts"]), 1)
+        self.fake.fail = {"/collections/mounts", "/collections/pets", "/collections/toys",
+                          "/collections/heirlooms", "/collections/transmogs"}
+        self.assertIsNone(self.client().get_character("test-char", sections=["collections"], refresh=True)["collections"])
+
+    def test_passthrough_sections(self):
+        c = self.client().get_character("test-char", sections=["appearance", "titles", "mythicKeystone", "encounters"])
+        a = c["appearance"]
+        self.assertNotIn("character", a)
+        self.assertNotIn("_links", a)
+        self.assertEqual(a["playableRace"], {"name": "Orc", "id": 2})
+        self.assertEqual(a["customizations"][0]["choice"], {"id": 984, "displayOrder": 0})
+        self.assertEqual(c["titles"], {})  # {} = API nic nevratilo
+        self.assertEqual(c["mythicKeystone"], {"currentPeriod": {"period": {"id": 1090}}})
+        self.assertEqual(c["encounters"], {"dungeons": {}, "raids": {"someField": {"innerValue": 1}}})
+
+    def test_passthrough_none_when_request_fails(self):
+        self.fake.fail = {"/appearance", "/titles", "/encounters/dungeons", "/encounters/raids"}
+        c = self.client().get_character("test-char", sections=["appearance", "titles", "encounters"])
+        self.assertEqual((c["appearance"], c["titles"], c["encounters"]), (None, None, None))  # None = selhalo
+
+    def test_achievements_in_progress(self):
+        a = self.client().get_character("test-char", sections=["achievements"])["achievements"]
+        self.assertEqual(a["inProgress"], [{"id": 3, "name": "In progress", "criteria": {"id": 9, "isCompleted": False}}])
+
+    # --- libovolny endpoint ---
+    def test_raw_untouched_clean_cached_and_validated(self):
+        doc = self.client().raw("/data/wow/achievement/855")
+        self.assertIn("_links", doc)
+        self.assertEqual(doc["category"]["key"], {"href": "y"})  # bez uprav
+        clean = self.client().raw("/data/wow/achievement/855", clean=True)  # novy "proces": z cache
+        self.assertEqual((clean["rewardDescription"], clean["category"]), ("r", {"name": "Exploration", "id": 3}))
+        self.assertEqual(self.fake.count("/data/wow/achievement/855"), 1)
+        with self.assertRaises(NotFound):
+            self.client().raw("/data/wow/achievement/999")
+        for bad in ("/etc/passwd", "/data/wow/../x", "https://evil.test/data/wow/x", "/data/wow/x?y=1"):
+            with self.assertRaises(ConfigError, msg=bad):
+                self.client().raw(bad)
+        with self.assertRaises(ConfigError):
+            self.client().raw("/data/wow/achievement/855", kind="bogus")
+
+    def test_raw_params_are_sorted_in_url(self):
+        self.client().raw("/data/wow/achievement/855", params={"b": 2, "a": 1}, refresh=True)
+        self.assertTrue(any("&a=1&b=2" in u for u in self.fake.calls))
+
+    # --- rulesety a aukce ---
+    def test_rulesets_and_auction_houses(self):
+        cl = self.client()
+        self.assertEqual(cl.get_rulesets(), [{"id": 1, "name": "PvP"}, {"id": 2, "name": "Normal"}])
+        houses = [{"id": 110, "name": "Alliance Auction House"}, {"id": 113, "name": "Horde Auction House"}]
+        self.assertEqual(cl.get_auction_houses(), houses)          # vychozi Normal
+        self.assertEqual(cl.get_auction_houses("normal"), houses)  # podle nazvu
+        self.assertEqual(cl.get_auction_houses(2), houses)         # podle id
+        with self.assertRaises(ConfigError) as cm:
+            cl.get_auction_houses("bogus")
+        self.assertIn("2=Normal", str(cm.exception))
+        with self.assertRaises(ConfigError):
+            cl.get_auction_houses(99)
+
+    def test_auctions_normalized_filtered_and_cached(self):
+        a = self.client().get_auctions(110)
+        self.assertEqual((a["house"], a["ruleset"], a["kind"], (a["total"], a["matched"], a["returned"])),
+                         ({"id": 110, "name": "Alliance Auction House"}, {"id": 2, "name": "Normal"}, "auctions", (3, 3, 3)))
+        self.assertEqual(a["auctions"][1], {"id": 2, "itemId": 11, "quantity": 2, "buyout": 200, "timeLeft": "SHORT",
+                                            "bid": 150, "context": 1, "modifiers": [{"type": 28, "value": 5}],
+                                            "bonusLists": [1, 2]})
+        self.assertNotIn("bid", a["auctions"][0])
+        n = self.fake.count("/auctions/110")
+        b = self.client().get_auctions("110", item_ids=[10], limit=1)  # novy "proces": filtr az nad cache na disku
+        self.assertEqual((b["total"], b["matched"], b["returned"], [x["id"] for x in b["auctions"]]), (3, 2, 1, [1]))
+        self.assertEqual(self.fake.count("/auctions/110"), n)
+
+    def test_commodities(self):
+        a = self.client().get_auctions(110, kind="commodities")
+        self.assertEqual(a["auctions"], [{"id": 5, "itemId": 20, "quantity": 17, "unitPrice": 20, "timeLeft": "LONG"}])
+        self.assertEqual(a["house"]["name"], "Alliance Auction House")  # nazev z seznamu domu (dokument ho nema)
+
+    def test_auction_item_names(self):
+        self.fake.items = {10: "Sword", 11: "Axe"}
+        a = self.client().get_auctions(110, names=True, item_ids=[10])
+        self.assertEqual({x["itemName"] for x in a["auctions"]}, {"Sword"})
+        with mock.patch.object(m, "_AUCTION_NAMES_MAX", 1):
+            with self.assertRaises(ConfigError):
+                self.client().get_auctions(110, names=True)  # 2 ruzne itemy > limit
+
+    def test_auction_errors(self):
+        cl = self.client()
+        with self.assertRaises(NotFound):
+            cl.get_auctions(999)
+        with self.assertRaises(ConfigError):
+            cl.get_auctions("abc")
+        with self.assertRaises(ConfigError):
+            cl.get_auctions(110, kind="bogus")
+
+    def test_cli_new_commands(self):
+        base = ["--env-file", "nonexist", "--client-id", "id123456789", "--client-secret", "s"]
+
+        def run(*args):
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"WOWSTATS_CACHE_DIR": str(self.tmp)}), contextlib.redirect_stdout(out):
+                code = cli.main([*args, *base])
+            return code, json.loads(out.getvalue()) if out.getvalue() else None
+
+        self.assertEqual(run("rulesets")[1][1], {"id": 2, "name": "Normal"})
+        self.assertEqual(run("auction-houses", "--ruleset", "2")[1][0]["id"], 110)
+        code, data = run("auctions", "110", "--item-id", "10", "--limit", "5")
+        self.assertEqual((code, data["matched"]), (0, 2))
+        code, data = run("raw", "/data/wow/achievement/855", "--clean")
+        self.assertEqual(data["rewardDescription"], "r")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"WOWSTATS_CACHE_DIR": str(self.tmp)}), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(["raw", "/data/wow/x", "--param", "chybi-rovnitko", *base]), 4)
 
     def test_lifetime_missing_when_api_fails(self):
         self.fake.lifetime_ok = False

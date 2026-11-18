@@ -53,6 +53,14 @@ foreach (var m in g.Members.Take(5))                    // seřazeno: rank, leve
 | `HunterPets` | `HunterPets` | `Name`, `Level`, `Slot`, `Active`, `Summoned`, `Creature`; `null` u jiných povolání než lovec |
 | `Specializations` | `Specializations` | skupiny `Active` + `Specializations` (`Name`, `Points`, `Talents` s `Rank`, `SpellId`, `Description`) |
 | `Icons` | `Gear[].IconUrl` | URL ikony z Blizzardu; **automaticky zahrne `Gear`**; cache `icons.json` sdílená s Pythonem |
+| `ItemDetails` | `Gear[].Details` (`JsonElement?`) | **celý záznam itemu z API** (bez odkazů, camelCase): `binding`, `stats`, `armor`, `weapon`, `durability`, `requirements`, `sellPrice`… Automaticky zahrne `Gear` |
+| `Recipes` | `Professions[].Tiers`, `Professions[].Recipes` | všechny známé recepty (`Id`, `Name`, `Tier`). Automaticky zahrne `Professions` |
+| `Collections` | `Collections` (`CollectionsInfo`) | `Mounts`, `Pets` (celé záznamy jako `JsonElement`), `UnlockedBattlePetSlots`, `Toys`, `Heirlooms`, `Transmogs`; část je `null`, když její dotaz selhal |
+| `Appearance` | `Appearance` (`JsonElement?`) | celý záznam: `playableRace`, `gender`, `guildCrest`, `items`, `customizations` |
+| `Encounters` | `Encounters` (`EncountersInfo`) | `Dungeons`, `Raids` jako `JsonElement` (zatím prázdné objekty) |
+| `Titles`, `MythicKeystone` | `Titles`, `MythicKeystone` (`JsonElement?`) | celé záznamy z API (zatím skoro prázdné) |
+
+Sekce vracené jako `JsonElement` jsou **celé záznamy z API** bez odkazů a s klíči v camelCase (`display_string` → `displayString`). Prázdný objekt `{}` znamená „API nic nevrátilo“, `null` „dotaz selhal“ nebo „sekce nebyla vyžádána“. V základu mají `Character` i nové vlastnosti `Experience`, `Gender`, `AchievementPoints`, `AverageItemLevel` a `AchievementsInfo.InProgress` (rozpracované úspěchy s kritérii).
 
 ```csharp
 Character c = await client.GetCharacterAsync("jmeno-prijmeni",
@@ -61,6 +69,24 @@ Console.WriteLine($"{c.Achievements!.Completed.Count} úspěchů, ikona: {c.Gear
 ```
 
 Názvy v těchto sekcích vrací API jen anglicky (knihovna žádá `en_GB`). **Změna oproti 0.2.0:** `All` dřív znamenalo výchozí výběr, teď znamená všechny sekce; výchozí hodnota parametru `sections` je `Default`, takže stávající volání bez parametru se chovají stejně. Podrobnosti v [../README.md](../README.md#další-sekce-na-vyžádání).
+
+### Aukce, rulesety a libovolný endpoint
+
+```csharp
+IReadOnlyList<Ruleset> rulesets = await client.GetRulesetsAsync();            // 1 PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP
+IReadOnlyList<AuctionHouse> houses = await client.GetAuctionHousesAsync();    // 15 domů (výchozí ruleset Normal)
+
+AuctionListing l = await client.GetAuctionsAsync(110,
+    kind: AuctionKind.Commodities, itemIds: [2589], limit: 100, names: true);
+Console.WriteLine($"{l.Matched} nabídek z {l.Total}, nejlevnější {l.Auctions.Min(a => a.UnitPrice)} copper");
+
+JsonElement achievement = await client.RawAsync("/data/wow/achievement/855", locale: "en_GB", clean: true);
+```
+
+- `GetAuctionsAsync(house, ruleset, kind, itemIds, limit, names, ttl, refresh)`: `house` je **id** domu (110, 111…), `ruleset` id nebo název (`"2"`, `"Normal"`). `Auction`: `Id`, `ItemId`, `Quantity`, `Buyout`/`Bid` (u `Auctions`), `UnitPrice` (u `Commodities`), `TimeLeft`, `Context`, `Modifiers`, `BonusLists`, `ItemName`. **Ceny jsou v copperu.** `AuctionListing`: `House`, `Ruleset`, `Kind`, `Total` (všechny nabídky domu), `Matched` (po filtru), `Returned` (po limitu).
+- Jeden dům má kolem 142 tisíc nabídek (15 MB). Cachuje se celý na disk a `itemIds` a `limit` se aplikují až nad cache. Data aukcí jsou u všech rulesetů totožná.
+- `RawAsync(path, kind = "static", parameters, locale, ttl, refresh, clean)` vrací libovolný endpoint (`/data/wow/…`, `/profile/wow/…`) jako `JsonElement`, s cache a ošetřením chyb (`NotFoundException`, `UpstreamException`, `ConfigException`). Jazyk bere z klienta; při `cs_CZ` jsou u Forever názvy `null`, proto předej `locale: "en_GB"`.
+- Podrobnosti a velikosti v [../README.md](../README.md#aukce-rulesety-a-libovolný-endpoint).
 
 `Guild`: `Name`, `Slug`, `Id`, `Faction`, `MemberCount`, `AchievementPoints`, `CreatedAt`, `Ruleset`, `Members`, `FetchedAt`, `Stale`.
 `GuildMember`: `Name`, `Surname`, `Slug`, `Level`, `CharacterClass`, `Race`, `Faction`, `Rank` (číslo, 0 bývá vedoucí; názvy ranků API nevrací). `Slug` člena jde použít v `GetCharacterAsync`. Aktivita, guildové achievementy a banka API neposkytuje.
@@ -75,6 +101,9 @@ Výjimky (společný předek `WowStatsException` s vlastností `Code`): `NotFoun
 cd csharp
 dotnet run --project WowStats.Sample -- character jmeno-prijmeni [Stats,Gear,Professions,Media] [--refresh] [--no-wowhead]
 dotnet run --project WowStats.Sample -- guild "Nazev Guildy" [--refresh] [--top 5]
+dotnet run --project WowStats.Sample -- rulesets
+dotnet run --project WowStats.Sample -- auctions 110 [--kind commodities] [--item 2589] [--limit 5] [--names]
+dotnet run --project WowStats.Sample -- raw /data/wow/achievement/855 [--kind static] [--clean]
 ```
 
 Ukázka hledá `.env` v aktuální složce a nahoru. Cache sdílí s Python verzí (token, názvy, itemy).

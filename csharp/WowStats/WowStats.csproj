@@ -6,7 +6,7 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>WowStats</RootNamespace>
     <PackageId>WowStats</PackageId>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Description>WoW Forever character and guild statistics (unofficial Blizzard API client).</Description>
   </PropertyGroup>

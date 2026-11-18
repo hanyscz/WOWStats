@@ -8,7 +8,7 @@ Statistiky postav a guild z **WoW Forever** (neoficiální Blizzard API). Žádn
 > - Názvy itemů, které Blizzard nezná, se doplňují z **neoficiálního endpointu Wowheadu**, který může také zmizet. Dá se vypnout (viz níže). Nezatěžuj ho: dotazy jsou cachované a mají odstup.
 > - Potřebuješ **vlastní klíče** (Client ID a Secret), zdarma na [develop.battle.net](https://develop.battle.net). Nikdy je necommituj, `.env` je v `.gitignore`.
 
-Tři cesty, stejný výsledek (JSON / objekt s poli `name`, `surname`, `level`, `race`, `characterClass`, `faction`, `guild`, `ruleset`, `itemLevel`, `lastLogin`, `stats`, `gear[]`, `professions[]`, `lifetime`, `avatarUrl`, `renderUrl`, `fetchedAt`, `stale`; na vyžádání ještě `achievements`, `reputations`, `quests`, `pvp`, `hunterPets`, `specializations` a `gear[].iconUrl`, viz [další sekce](#další-sekce-na-vyžádání)). Přesně co jde z API stáhnout a co z toho knihovna umí, je v [přehledu API](#přehled-dostupných-api):
+Tři cesty, stejný výsledek (JSON / objekt s poli `name`, `surname`, `level`, `race`, `characterClass`, `faction`, `guild`, `ruleset`, `itemLevel`, `lastLogin`, `stats`, `gear[]`, `professions[]`, `lifetime`, `avatarUrl`, `renderUrl`, `fetchedAt`, `stale`; na vyžádání ještě `achievements`, `reputations`, `quests`, `pvp`, `hunterPets`, `specializations`, `collections`, `appearance`, `encounters`, `titles`, `mythicKeystone`, `gear[].iconUrl`, `gear[].details` a `professions[].recipes`, viz [další sekce](#další-sekce-na-vyžádání); mimo postavu ještě [aukce a rulesety](#aukce-rulesety-a-libovolný-endpoint) a obecné volání `raw`). Přesně co jde z API stáhnout a co z toho knihovna umí, je v [přehledu API](#přehled-dostupných-api):
 
 | Použití | Jak |
 |---|---|
@@ -37,7 +37,7 @@ Pořadí: argumenty > proměnné prostředí > `.env`. Zkopíruj `.env.example` 
 | Parametr | Význam |
 |---|---|
 | jméno | slug `jmeno-prijmeni` nebo `"Jmeno Prijmeni"` (ve Forever nejsou realmy, postava je jedinečná v rámci regionu) |
-| sekce | výchozí: `stats, gear, professions, media, lifetime`; na vyžádání `achievements, reputations, quests, pvp, hunterPets, specializations, icons`. Lze zadat seznam, řetězec oddělený čárkami, `default` nebo `all`. Méně sekcí = méně HTTP dotazů (profil je vždy, každá sekce je aspoň jeden dotaz navíc) |
+| sekce | výchozí: `stats, gear, professions, media, lifetime`; na vyžádání `achievements, reputations, quests, pvp, hunterPets, specializations, icons, itemDetails, recipes, collections, appearance, encounters, titles, mythicKeystone`. Lze zadat seznam, řetězec oddělený čárkami, `default` nebo `all`. Méně sekcí = méně HTTP dotazů (profil je vždy, každá sekce je aspoň jeden dotaz navíc) |
 | ttl | jak dlouho se bere výsledek z disku (výchozí 900 s) |
 | refresh | obejde cache |
 | wowhead | doplnit názvy itemů z Wowheadu (výchozí zapnuto): Python `use_wowhead=False`, CLI `--no-wowhead`, C# `UseWowhead = false`, env `WOWSTATS_WOWHEAD=0` |
@@ -75,6 +75,10 @@ print(hl["deaths"], hl["deathsFalling"], hl["totalKills"])
 # další sekce na vyžádání (každá je aspoň jeden dotaz navíc), "all" vezme všechno
 c = get_character("jmeno-prijmeni", sections=["achievements", "reputations", "icons"])
 print(c["achievements"]["completed"][-1], c["gear"][0]["iconUrl"])
+
+# celé detaily itemů, všechny recepty a sbírky
+c = get_character("jmeno-prijmeni", sections=["itemDetails", "recipes", "collections"])
+print(c["gear"][0]["details"]["binding"]["name"], len(c["professions"][0]["recipes"]), len(c["collections"]["mounts"]))
 
 g = get_guild("Nazev Guildy")
 print(g["memberCount"], [m["name"] for m in g["members"][:3]])
@@ -135,29 +139,102 @@ Sekce `lifetime` stahuje `achievements/statistics`: smrti, zabití, questy, batt
 
 ## Další sekce na vyžádání
 
-Kromě výchozích sekcí (`stats, gear, professions, media, lifetime`) umí `get_character` na požádání dalších šest sekcí a ikony itemů. **Nestahují se, dokud o ně nepožádáš**, protože každá znamená aspoň jeden HTTP dotaz navíc na postavu. `sections="all"` (CLI `--sections all`, C# `CharacterSections.All`) vezme všechno. Aplikace si tak vyžádá jen to, co potřebuje.
+Kromě výchozích sekcí (`stats, gear, professions, media, lifetime`) umí `get_character` na požádání dalších čtrnáct. **Nestahují se, dokud o ně nepožádáš**, protože každá znamená aspoň jeden HTTP dotaz navíc na postavu. `sections="all"` (CLI `--sections all`, C# `CharacterSections.All`) vezme všechno. Aplikace si tak vyžádá jen to, co potřebuje. Filozofie je „vrať všechno, co API dává“: kde tvar dat není nijak zvlášť zpracovaný, dostaneš celý záznam z API.
 
 | Sekce | Pole v odpovědi | Dotazů | Co obsahuje |
 |---|---|---|---|
-| `achievements` | `achievements` | 1 | `total`, `points`, `completed[]` (`{id, name, completedAt}`, seřazeno podle času splnění), `recent[]` (`{id, name, at}`), `categories[]` (`{id, name, quantity, points}`). Rozpracované úspěchy se vynechávají |
+| `achievements` | `achievements` | 1 | `total`, `points`, `completed[]` (`{id, name, completedAt}`, seřazeno podle času splnění), `recent[]` (`{id, name, at}`), `categories[]` (`{id, name, quantity, points}`), `inProgress[]` (`{id, name, criteria}`, kde `criteria` je záznam z API: `id`, `isCompleted`, `childCriteria[{id, amount, isCompleted}]`) |
 | `reputations` | `reputations[]` | 1 | `{id, name, standing, tier, value, max, raw}`. `standing` je např. „Honored“, `tier` 3 Neutral až 7 Exalted, `value`/`max` je postup v aktuální úrovni, `raw` celkem. Seřazeno: tier sestupně, pak název |
 | `quests` | `quests` | 2 | `completedCount`, `completed[]` (`{id, name}`), `inProgress[]`. `completed` a `completedCount` jsou `null`, když se seznam splněných nepodařilo získat |
 | `pvp` | `pvp` | 1 | `honorableKills`, `rank`, `battlegrounds[]` (`{id, name, played, won, lost}`) |
 | `hunterPets` | `hunterPets[]` | 1 | `{name, level, slot, active, summoned, creatureId, creature}`. U jiných povolání než lovec je **`null`** (API vrací 404) |
 | `specializations` | `specializations[]` | 1 | skupiny `{active, specializations: [{id, name, points, talents: [{id, name, rank, spellId, description}]}]}`. Jen stromy talentů s utracenými body |
 | `icons` | `gear[].iconUrl` | 0 až N | URL ikony itemu z Blizzardu. **Automaticky zahrne `gear`.** Jeden dotaz na každý dosud neznámý item, pak trvale v cache (`icons.json`, sdílená s C#). Nenalezený item (404) se zkusí znovu po 7 dnech, chyby sítě se neukládají. Bez `icons` pole `iconUrl` v `gear` není |
+| `itemDetails` | `gear[].details` | 0 | **Celý záznam itemu z API** (bez odkazů, klíče v camelCase): `binding`, `stats[]` (`type`, `value`, `display.displayString`), `armor`, `weapon`, `durability`, `requirements`, `sellPrice`, `spells`, `inventoryType`, `itemClass`, `itemSubclass`, `uniqueEquipped`, `quantity`, `context`, `media`… Nic se nezahazuje. **Automaticky zahrne `gear`**, žádný další dotaz (jen se vyžádá `equipment` v angličtině) |
+| `recipes` | `professions[].tiers`, `professions[].recipes` | 0 | `tiers[]` (`{id, name, skill, maxSkill}`) a `recipes[]` (`{id, name, tier}`), všechny známé recepty. **Automaticky zahrne `professions`**, žádný další dotaz. Detail receptu (suroviny, vyráběný item) je statický dokument, viz `raw("/data/wow/recipe/{id}")` |
+| `collections` | `collections` | 5 | `mounts[]` (`{id, name, usable}`), `pets[]` (celý záznam: `species`, `level`, `quality`, `stats`, `creatureDisplay`, `id`), `unlockedBattlePetSlots`, `toys[]` (`{id, name}`), `heirlooms[]`, `transmogs[]` (`{slot, appearanceIds[]}`). Část je `null`, když její dotaz selhal; prázdná sbírka je `[]`. U tvé postavy bývají prázdné, u aktivnějších hráčů ne |
+| `appearance` | `appearance` | 1 | celý záznam: `playableRace`, `playableClass`, `gender`, `faction`, `guildCrest`, `items[]` (vzhledové itemy se slotem a enchantem), `customizations[]` (`option`, `choice`) |
+| `encounters` | `encounters` | 2 | `{dungeons, raids}`: celé dokumenty z API. **Ve Forever zatím vracejí prázdné objekty**, zabití bossů jsou v `lifetime.all` (kategorie „Dungeons & Raids/Boss Kills“) |
+| `titles` | `titles` | 1 | celý záznam z API (zatím prázdný objekt) |
+| `mythicKeystone` | `mythicKeystone` | 1 | celý záznam z API (zatím jen `currentPeriod`) |
 
 Společná pravidla:
 - Názvy v těchto sekcích vrací API **jen anglicky**, proto knihovna žádá `en_GB` bez ohledu na nastavený jazyk.
-- Pole sekce je `null`, když ji API nevrátilo (chyba, nebo u `hunterPets` jiné povolání).
+- Pole sekce je `null`, když ji API nevrátilo (chyba, nebo u `hunterPets` jiné povolání). U sekcí, které se vracejí „jak jsou“ (`appearance`, `titles`, `mythicKeystone`, `encounters`), znamená **`{}` „API nic nevrátilo“** a `null` „dotaz selhal“.
 - Pro nepožadované sekce klíč v odpovědi vůbec není (C#: vlastnost je `null`).
-- Cena: první stažení všech sekcí jedné postavy trvalo kolem 7 až 9 s (asi 13 dotazů plus jednorázově názvy a ikony), další z cache zlomek sekundy. Pro desítky postav radši vyžádej jen potřebné sekce.
+- „Celý záznam z API“ znamená odpověď beze ztrát, jen bez odkazů (`_links`, `key: {href}`) a s klíči v camelCase (`display_string` → `displayString`). Hodnoty a vnoření zůstávají. Struktura odpovídá Blizzard API, takže se hodí i jejich dokumentace.
+- Cena: první stažení **všech** sekcí jedné postavy (kolem 23 dotazů plus jednorázově názvy a ikony) trvalo kolem 5 až 9 s, další z cache zlomek sekundy. Pro desítky postav radši vyžádej jen potřebné sekce.
+- **U každé postavy se v základu vracejí i `experience`, `gender`, `achievementPoints` a `averageItemLevel`** (jsou v profilu, žádný dotaz navíc).
 
-**Změna oproti 0.2.0:** výchozí sekce zůstaly stejné (`DEFAULT_SECTIONS` v Pythonu, `CharacterSections.Default` v C#), takže stávající kód se chová jako dřív. Ale `ALL_SECTIONS` (Python) a `CharacterSections.All` (C#) dřív znamenaly výchozí výběr a teď znamenají všechny sekce. Kód, který `All` předával výslovně, dostane víc dotazů, a tím i víc dat.
+**Změny a kompatibilita.** Všechny úpravy jsou přidání nových polí a sekcí, výchozí chování se nemění (`DEFAULT_SECTIONS` v Pythonu, `CharacterSections.Default` v C#). Výjimka z 0.3.0: `ALL_SECTIONS` (Python) a `CharacterSections.All` (C#) dřív znamenaly výchozí výběr a teď znamenají všechny sekce, takže kód, který `All` předával výslovně, dostane víc dotazů i dat. C# `Character`, `GearItem`, `Profession` a `AchievementsInfo` mají nové vlastnosti. Kdo je vytváří ručně pozičním konstruktorem (typicky v testech), musí je doplnit.
+
+## Aukce, rulesety a libovolný endpoint
+
+### Rulesety a aukce
+
+Ve Forever nejsou realmy, ale **rulesety**: `1` PvP, `2` Normal, `3` Roleplay, `15` Roleplay PvP. **Data aukcí jsou u všech rulesetů stejná** (ověřeno: stejných 142 397 nabídek se stejným prvním id), ruleset aukce nefiltruje. Výchozí je proto `Normal`.
+
+| Python | C# | CLI |
+|---|---|---|
+| `get_rulesets()` → `[{id, name}]` | `GetRulesetsAsync()` | `wowstats rulesets` |
+| `get_auction_houses(ruleset=None)` → `[{id, name}]` (15 domů) | `GetAuctionHousesAsync(ruleset)` | `wowstats auction-houses` |
+| `get_auctions(house, ...)` | `GetAuctionsAsync(house, ...)` | `wowstats auctions <dum>` |
+
+`ruleset` je id nebo název (`2`, `"Normal"`). Domy se jmenují opakovaně (3× Alliance, 3× Horde, Blackwater…), proto se `house` zadává **id** (110, 111…).
+
+`get_auctions(house, *, ruleset=None, kind="auctions", item_ids=None, limit=None, names=False, ttl=None, refresh=False)`:
+
+| Parametr | Význam |
+|---|---|
+| `kind` | `"auctions"` = jednotlivé nabídky, `"commodities"` = hromadné zboží (látka, byliny, lektvary) |
+| `item_ids` | jen tyto itemy (filtr se aplikuje na cachovaná data) |
+| `limit` | nejvýš N nabídek |
+| `names` | doplní `itemName` (nejvýš 500 různých itemů; každý neznámý je dotaz, pak je v cache) |
+
+Odpověď: `house`, `ruleset`, `kind`, `total` (všechny nabídky domu), `matched` (po filtru), `returned` (po limitu), `auctions[]`, `fetchedAt`, `stale`.
+Nabídka: `kind="auctions"`: `{id, itemId, quantity, buyout, timeLeft}` plus `bid`, `context`, `modifiers[]`, `bonusLists[]`, když je API má. `kind="commodities"`: `{id, itemId, quantity, unitPrice, timeLeft}`. **Ceny jsou v copperu** (100 copper = 1 silver, 10 000 = 1 gold). `timeLeft` nabývá hodnot `SHORT`, `MEDIUM`, `LONG` (jiné jsem v datech neviděl).
+
+**Velikost:** jeden dům má kolem 142 tisíc nabídek a 131 tisíc komodit (15 MB a 12 MB JSON). Stažení trvá zhruba 2 s, výsledek se **uloží celý na disk** (cache) a `item_ids` a `limit` se aplikují až nad ním, takže další volání z libovolného procesu je v Pythonu kolem 0,2 s (v C# kolem 1,5 s včetně spuštění procesu .NET). Hodnotu `ttl` nastav podle toho, jak čerstvá data potřebuješ (výchozí 900 s).
+
+```python
+from wowstats import ForeverClient
+c = ForeverClient.from_env()
+cheap = c.get_auctions(110, kind="commodities", item_ids=[2589], names=True)   # Linen Cloth
+print(min(a["unitPrice"] for a in cheap["auctions"]), "copper")
+```
+
+```
+wowstats auctions 110 --kind commodities --item-id 2589 --limit 5 --names
+```
+
+```csharp
+var l = await client.GetAuctionsAsync(110, kind: AuctionKind.Commodities, itemIds: [2589], names: true);
+Console.WriteLine($"{l.Matched} nabídek, nejlevnější {l.Auctions.Min(a => a.UnitPrice)} copper");
+```
+
+### Libovolný endpoint (`raw`)
+
+Pro všechno, co knihovna nezabaluje (statická data, vyhledávání, nové endpointy, které Blizzard přidá), je obecné volání. Vrací JSON tak, jak přišel, **cachuje ho na disk** a řeší token, namespace a chyby:
+
+| | |
+|---|---|
+| Python | `client.raw(path, kind="static", params=None, locale=None, ttl=None, refresh=False, clean=False)` |
+| C# | `await client.RawAsync(path, kind, parameters, locale, ttl, refresh, clean)` → `JsonElement` |
+| CLI | `wowstats raw <cesta> [--kind static\|dynamic\|profile] [--param klic=hodnota] [--clean]` |
+
+`path` musí začínat `/data/wow/` nebo `/profile/wow/`. `kind` volí namespace (`static-forever-…`, `dynamic-forever-…`, `profile-forever-…`). `clean=True` odstraní odkazy a přepíše klíče do camelCase, stejně jako u „celých záznamů“. 404 je `NotFound` (kód 2), jiná chyba `UpstreamError` (3), špatná cesta `ConfigError` (4). Jazyk bere z klienta (`locale`), takže při `cs_CZ` jsou u Forever názvy `null`: pro čitelné texty předej `locale="en_GB"`.
+
+```python
+client.raw("/data/wow/achievement/855", locale="en_GB", clean=True)          # definice úspěchu
+client.raw("/data/wow/recipe/1353", locale="en_GB")                          # recept: suroviny, vyráběný item
+client.raw("/data/wow/item/9807")                                            # detail itemu (část itemů je 404)
+client.raw("/data/wow/search/item", params={"name.en_GB": "Linen Cloth", "orderby": "id"})   # hledání itemů
+client.raw("/data/wow/ruleset/2", kind="dynamic")
+```
 
 ## Přehled dostupných API
 
-Co přesně jde z Blizzard API (a Wowheadu) stáhnout. Ověřeno 18. 11. 2026 na regionu EU voláním každého endpointu. Sloupec **Knihovna** říká, jestli to `wowstats` už umí: ✅ ano (v jaké sekci/poli), ❌ ne (API to nabízí, ale knihovna to zatím nestahuje).
+Co přesně jde z Blizzard API (a Wowheadu) stáhnout. Ověřeno 18. 11. 2026 na regionu EU voláním každého endpointu. Sloupec **Knihovna** říká, jak se k tomu dostaneš: ✅ hotová sekce nebo funkce (v jaké), 🔧 přes obecné volání [`raw`](#libovolný-endpoint-raw) (knihovna řeší token, cache a chyby, tvar dat je přímo z API), ❌ nic z toho (zatím žádný takový endpoint, vyjma OAuth níže).
 
 Všechny dotazy jdou na `https://{region}.api.blizzard.com`, s parametry `namespace=…` a `locale=…` a s tokenem z `oauth.battle.net/token` (client credentials, stačí Client ID + Secret). Postava se adresuje `jmeno-prijmeni` (bez realmu). Nic z toho **není oficiálně zdokumentované** ([zdroj](https://mhuijskens.com/WoWForever/Api/)).
 
@@ -165,10 +242,10 @@ Všechny dotazy jdou na `https://{region}.api.blizzard.com`, s parametry `namesp
 
 | Endpoint (za cestou postavy) | Co vrací | Knihovna |
 |---|---|---|
-| *(bez přípony)* | jméno, příjmení, level, zkušenosti, rasa, třída, frakce, pohlaví, guilda, ruleset, item level (průměrný i nasazený), poslední přihlášení | ✅ základ odpovědi |
+| *(bez přípony)* | jméno, příjmení, level, zkušenosti, rasa, třída, frakce, pohlaví, guilda, ruleset, item level (průměrný i nasazený), body za úspěchy, poslední přihlášení | ✅ základ odpovědi (včetně `experience`, `gender`, `achievementPoints`, `averageItemLevel`) |
 | `/statistics` | atributy, crit, hit, útočná síla, brnění, dodge, parry, block, zdraví, zdroj… (~57 hodnot) | ✅ `stats` |
-| `/equipment` | nasazené itemy: slot, id, kvalita, item level, brnění, bonusy, odolnost, požadavky, prodejní cena | ✅ `gear` (slot, id, název, kvalita, ilvl) |
-| `/professions` | primární a vedlejší profese, skill, maximum, seznam známých receptů | ✅ `professions` (skill a maximum) |
+| `/equipment` | nasazené itemy: slot, id, kvalita, item level, brnění, bonusy, odolnost, požadavky, prodejní cena | ✅ `gear` (slot, id, název, kvalita, ilvl) a **`itemDetails`** (celý záznam) |
+| `/professions` | primární a vedlejší profese, skill, maximum, seznam známých receptů | ✅ `professions` (skill a maximum) a **`recipes`** (všechny recepty) |
 | `/character-media` | obrázky postavy (`avatar`, `avatar-sd`, `main-raw`, `main-sd-raw`) | ✅ `avatarUrl`, `renderUrl` |
 | `/achievements/statistics` | statistiky za celou dobu: smrti, zabití, questy, PvP, dungeony, profese… | ✅ `lifetime` |
 | `/achievements` | splněné úspěchy s časem, celkové body, poslední události | ✅ `achievements` |
@@ -176,12 +253,12 @@ Všechny dotazy jdou na `https://{region}.api.blizzard.com`, s parametry `namesp
 | `/reputations` | reputace u frakcí (úroveň, postup) | ✅ `reputations` |
 | `/quests/completed` | seznam splněných questů s názvy (u testované postavy 306) | ✅ `quests` |
 | `/quests` | rozpracované questy | ✅ `quests` |
-| `/appearance` | vzhled postavy (rasa, pohlaví, customizace, erb guildy, itemy) | ❌ |
+| `/appearance` | vzhled postavy (rasa, pohlaví, customizace, erb guildy, itemy) | ✅ `appearance` |
 | `/pvp-summary` | čestná zabití, PvP hodnost, statistiky battlegroundů | ✅ `pvp` |
 | `/hunter-pets` | peti lovce (jméno, level, druh) | ✅ `hunterPets` (u ne-lovců 404, v knihovně `null`; na fóru psali, že vrací 404 všem, nám vrací data) |
-| `/encounters`, `/encounters/dungeons`, `/encounters/raids` | postup dungeony a raidy | ❌ (u testované postavy prázdné) |
-| `/collections`, `/collections/mounts`, `/pets`, `/toys` | mounty, mazlíčci, hračky, transmog | ❌ (u testované postavy prázdné) |
-| `/titles`, `/mythic-keystone-profile` | tituly, mythic+ | ❌ (odpovídají, ale bez dat) |
+| `/encounters`, `/encounters/dungeons`, `/encounters/raids` | postup dungeony a raidy | ✅ `encounters` (u všech otestovaných postav zatím prázdné) |
+| `/collections` + `/mounts`, `/pets`, `/toys`, `/heirlooms`, `/transmogs` | mounty, mazlíčci, hračky, dědictví, transmog (21 slotů) | ✅ `collections` (data mají aktivnější hráči, `heirlooms` zatím prázdné) |
+| `/titles`, `/mythic-keystone-profile` | tituly, mythic+ | ✅ `titles`, `mythicKeystone` (odpovídají, ale zatím skoro bez dat) |
 
 Postava se objeví až od levelu 10 (níž je 404) a data se aktualizují po odhlášení ze hry.
 
@@ -203,29 +280,42 @@ Funguje bez ohledu na postavu. Používá se hlavně k překladu `id` na názvy 
 |---|---|---|
 | `playable-class/index`, `/{id}` | povolání (9), specializace, rasy, zdroj | ✅ jen názvy |
 | `playable-race/index`, `/{id}` | rasy (10), frakce, povolání, rasové schopnosti | ✅ jen názvy |
-| `playable-specialization/index`, `/{id}` | specializace (27) | ❌ |
-| `talent-tree/index` | talentové stromy (27 specializací + 9 tříd) | ❌ |
-| `item/{id}` | detail itemu | ✅ názvy, ale **část itemů vrací 404** (u testované postavy kolem poloviny hledaných) |
+| `playable-specialization/index`, `/{id}` | specializace (27) | 🔧 `raw` |
+| `talent-tree/index` | talentové stromy (27 specializací + 9 tříd) | 🔧 `raw` |
+| `item/{id}` | detail itemu | ✅ názvy (a 🔧 `raw` pro celý záznam), ale **část itemů vrací 404** (u testované postavy kolem poloviny hledaných) |
 | `media/item/{id}` | **ikona itemu** (`render.worldofwarcraft.com/forever-{region}/icons/…`), funguje i pro itemy, které `item/{id}` nezná | ✅ `icons` (`gear[].iconUrl`) |
-| `item-class/index`, `/{id}` | druhy itemů (13) a podtypy | ❌ |
-| `profession/index`, `/{id}`, `recipe/{id}` | profese (13), recepty, suroviny | ✅ jen názvy profesí |
-| `achievement/index`, `achievement-category/index` | úspěchy (176), kategorie | ❌ |
-| `reputation-faction/index`, `/{id}` | frakce reputace (56) | ❌ |
-| `mount/index`, `pet/index`, `title/index` | mounty (141), mazlíčci (110), tituly (41) | ❌ |
-| `power-type/index`, `creature-family/index`, `spell/{id}` | typy zdroje, rodiny tvorů, kouzla | ❌ |
-| `search/item?name.en_GB=sword&orderby=id` | vyhledávání itemů podle názvu, stránkované po 100 | ❌ (hledání podle `id` nic nevrátilo, na chybějící názvy nepomůže) |
+| `item-class/index`, `/{id}` | druhy itemů (13) a podtypy | 🔧 `raw` |
+| `profession/index`, `/{id}`, `recipe/{id}` | profese (13), recepty, suroviny | ✅ názvy profesí; recepty postavy v `recipes`; detail receptu 🔧 `raw` |
+| `achievement/index`, `/{id}`, `achievement-category/index` | úspěchy (176) a jejich definice, kategorie | 🔧 `raw` |
+| `reputation-faction/index`, `/{id}` | frakce reputace (56) | 🔧 `raw` |
+| `mount/index`, `pet/index`, `title/index` | mounty (141), mazlíčci (110), tituly (41) | 🔧 `raw` |
+| `power-type/index`, `creature-family/index`, `spell/{id}` | typy zdroje, rodiny tvorů, kouzla | 🔧 `raw` |
+| `search/item?name.en_GB=sword&orderby=id` | vyhledávání itemů podle názvu, stránkované po 100, názvy ve všech jazycích | 🔧 `raw` s `params` (hledání podle `id` nic nevrátilo, na chybějící názvy nepomůže) |
 
 ### Dynamická data: `/data/wow/…` (namespace `dynamic-forever-{region}`)
 
 | Endpoint | Co vrací | Knihovna |
 |---|---|---|
-| `ruleset/index`, `ruleset/{id}` | rulesety místo realmů (v EU 4; „Normal“ má id 2) | ✅ jen název |
-| `ruleset/{id}/auctions/` | 15 aukčních domů a jejich nabídky (lomítko na konci je nutné; všechny rulesety vracejí tytéž domy) | ❌ |
+| `ruleset/index`, `ruleset/{id}` | rulesety místo realmů (v EU 4: 1 PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP) | ✅ `get_rulesets` |
+| `ruleset/{id}/auctions/` | 15 aukčních domů (lomítko na konci je nutné) | ✅ `get_auction_houses` |
+| `ruleset/{id}/auctions/{dum}` | všechny nabídky domu (kolem 142 tisíc, 15 MB) | ✅ `get_auctions` (`kind="auctions"`) |
+| `ruleset/{id}/auctions/{dum}/commodities` | hromadné zboží (kolem 131 tisíc, 12 MB) | ✅ `get_auctions` (`kind="commodities"`) |
+
+Data aukcí jsou u všech čtyř rulesetů **totožná** (zvláštnost API), ruleset je nefiltruje.
 | `realm/index`, `token/index` | **404**: realmy ani cena WoW tokenu ve Forever neexistují | – |
+
+### Co API nenabízí vůbec
+
+V odpovědích jsem nic z toho nenašel, takže to nejde získat ani přes `raw`:
+- **Jména ranků v guildě**, guildová banka, zpráva dne, online stav členů. Rank je jen číslo.
+- **Historie v čase.** API dává jen aktuální stav. Změny (nové levely, nové smrti) musí aplikace skládat z vlastních snímků.
+- **Záznam smrtí** s časem a příčinou. Jsou jen počítadla (`lifetime`).
+- **Hledání postav a guild podle části jména** a seznam všech guild. Musí se znát přesné jméno.
+- **Názvy v češtině a dalších jazycích** pro Forever (jen angličtina), realmy a cena WoW tokenu (404).
 
 ### Nezkoušeno
 
-`/profile/user/wow` (seznam všech postav na účtu) vyžaduje přihlášení hráče přes OAuth (scope `wow.profile`), ne jen Client ID a Secret.
+`/profile/user/wow` (seznam všech postav na účtu) vyžaduje přihlášení hráče přes OAuth (scope `wow.profile`), ne jen Client ID a Secret. Přes `raw` jde zavolat jen s uživatelským tokenem, který knihovna neumí získat.
 
 ### Wowhead (neoficiální, jen názvy itemů)
 

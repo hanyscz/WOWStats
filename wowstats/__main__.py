@@ -1,13 +1,14 @@
-"""CLI: wowstats character <jmeno> | wowstats guild <nazev>  -> JSON na stdout.
+"""CLI: wowstats character <jmeno> | guild <nazev> | rulesets | auction-houses | auctions <dum> | raw <cesta>
+-> JSON na stdout.
 
-Navratove kody: 0 ok, 2 postava/guilda nenalezena, 3 chyba Blizzard API, 4 chybna konfigurace.
+Navratove kody: 0 ok, 2 postava/guilda/dum/cesta nenalezena, 3 chyba Blizzard API, 4 chybna konfigurace.
 Chyby jdou jako JSON na stderr: {"error": "...", "code": N}.
 """
 import argparse
 import json
 import sys
 
-from . import ALL_SECTIONS, DEFAULT_SECTIONS, ForeverClient, WowStatsError
+from . import ALL_SECTIONS, DEFAULT_SECTIONS, ConfigError, ForeverClient, WowStatsError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,6 +35,27 @@ def _parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("guild", parents=[common], help="guilda a seznam clenu")
     g.add_argument("name", help="slug nebo nazev guildy, napr. 'Nazev Guildy' / nazev-guildy")
+
+    sub.add_parser("rulesets", parents=[common], help="rulesety (misto realmu): id a nazev")
+
+    ah = sub.add_parser("auction-houses", parents=[common], help="aukcni domy")
+    ah.add_argument("--ruleset", help="id nebo nazev (vychozi Normal; data aukci jsou u vsech rulesetu stejna)")
+
+    au = sub.add_parser("auctions", parents=[common], help="nabidky v aukcnim dome (velke, cachuje se na disk)")
+    au.add_argument("house", help="id aukcniho domu (viz auction-houses)")
+    au.add_argument("--ruleset", help="id nebo nazev (vychozi Normal)")
+    au.add_argument("--kind", default="auctions", choices=["auctions", "commodities"],
+                    help="auctions = jednotlive nabidky, commodities = hromadne zbozi")
+    au.add_argument("--item-id", type=int, action="append", dest="item_ids", metavar="ID",
+                    help="jen tento item (lze opakovat)")
+    au.add_argument("--limit", type=int, help="vratit nejvyse N nabidek")
+    au.add_argument("--names", action="store_true", help="doplnit nazvy itemu (max. 500 ruznych)")
+
+    rw = sub.add_parser("raw", parents=[common], help="libovolny endpoint Blizzard API (/data/wow/… nebo /profile/wow/…)")
+    rw.add_argument("path", help="napr. /data/wow/achievement/855")
+    rw.add_argument("--kind", default="static", choices=["static", "dynamic", "profile"], help="namespace (vychozi static)")
+    rw.add_argument("--param", action="append", default=[], metavar="KLIC=HODNOTA", help="dalsi parametr dotazu (lze opakovat)")
+    rw.add_argument("--clean", action="store_true", help="bez odkazu, klice v camelCase")
     return ap
 
 
@@ -48,6 +70,22 @@ def main(argv=None) -> int:
                                         use_wowhead=False if getattr(a, "no_wowhead", False) else None)
         if a.cmd == "guild":
             data = client.get_guild(a.name, ttl=a.ttl, refresh=a.refresh)
+        elif a.cmd == "rulesets":
+            data = client.get_rulesets(ttl=a.ttl, refresh=a.refresh)
+        elif a.cmd == "auction-houses":
+            data = client.get_auction_houses(a.ruleset, ttl=a.ttl, refresh=a.refresh)
+        elif a.cmd == "auctions":
+            data = client.get_auctions(a.house, ruleset=a.ruleset, kind=a.kind, item_ids=a.item_ids, limit=a.limit,
+                                       names=a.names, ttl=a.ttl, refresh=a.refresh)
+        elif a.cmd == "raw":
+            params = {}
+            for p in a.param:
+                if "=" not in p:
+                    raise ConfigError(f"--param ocekava KLIC=HODNOTA, dostal jsem {p!r}")
+                k, v = p.split("=", 1)
+                params[k] = v
+            data = client.raw(a.path, kind=a.kind, params=params or None, locale=a.locale, ttl=a.ttl,
+                              refresh=a.refresh, clean=a.clean)
         else:
             data = client.get_character(a.name, sections=a.sections, ttl=a.ttl, refresh=a.refresh)
     except WowStatsError as e:

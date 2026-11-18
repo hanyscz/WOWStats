@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -52,6 +53,11 @@ public sealed partial class ForeverClient : IDisposable
     [GeneratedRegex(@"^[\w-]{1,60}$")]
     private static partial Regex SlugRe();
 
+    [GeneratedRegex(@"^/(data|profile)/wow/[\w\-./]*$")]
+    private static partial Regex RawPathRe();
+
+    private const int AuctionNamesMax = 500; // nejvíc různých itemů, u kterých se u aukcí řeší názvy (každý neznámý = dotaz)
+
     // ---------- veřejné API ----------
 
     /// <param name="name">Slug nebo "Jmeno Prijmeni".</param>
@@ -60,7 +66,9 @@ public sealed partial class ForeverClient : IDisposable
     {
         var slug = name.Trim().ToLowerInvariant().Replace(' ', '-');
         if (!SlugRe().IsMatch(slug)) throw new CharacterNotFoundException($"Neplatné jméno postavy: '{name}'");
-        if (sections.HasFlag(CharacterSections.Icons)) sections |= CharacterSections.Gear; // ikony se přidávají k vybavení
+        // ikony a detaily se přidávají k vybavení, recepty k profesím
+        if (sections.HasFlag(CharacterSections.Icons) || sections.HasFlag(CharacterSections.ItemDetails)) sections |= CharacterSections.Gear;
+        if (sections.HasFlag(CharacterSections.Recipes)) sections |= CharacterSections.Professions;
 
         var file = Path.Combine(_cache, $"cs-char-{_o.Region}-{slug}-{(int)sections}.json");
         return await CachedAsync(file, ttl, refresh, () => FetchAsync(slug, sections, ct), c => c with { Stale = true });
@@ -74,6 +82,147 @@ public sealed partial class ForeverClient : IDisposable
         if (!SlugRe().IsMatch(slug)) throw new GuildNotFoundException($"Neplatný název guildy: '{name}'");
         var file = Path.Combine(_cache, $"cs-guild-{_o.Region}-{slug}.json");
         return await CachedAsync(file, ttl, refresh, () => FetchGuildAsync(slug, ct), g => g with { Stale = true });
+    }
+
+    // ---------- libovolný endpoint, rulesety a aukce ----------
+
+    private sealed record RawDoc(JsonElement Doc);
+    private sealed record RulesetList(List<Ruleset> Items);
+    private sealed record HouseList(List<AuctionHouse> Items);
+
+    /// <summary>
+    /// Libovolný endpoint Blizzard API (cesta začíná /data/wow/ nebo /profile/wow/). Vrací JSON tak, jak přišel
+    /// (<paramref name="clean"/> = bez odkazů a s klíči v camelCase). <paramref name="kind"/>: "static" (výchozí),
+    /// "dynamic" nebo "profile". 404 → <see cref="NotFoundException"/>, jiná chyba → <see cref="UpstreamException"/>.
+    /// Výsledek se cachuje na disk.
+    /// </summary>
+    public async Task<JsonElement> RawAsync(string path, string kind = "static",
+        IReadOnlyDictionary<string, string>? parameters = null, string? locale = null, TimeSpan? ttl = null,
+        bool refresh = false, bool clean = false, CancellationToken ct = default)
+    {
+        if (kind is not ("profile" or "static" or "dynamic"))
+            throw new ConfigException($"Neplatný kind '{kind}' (platné: profile, static, dynamic)");
+        if (!RawPathRe().IsMatch(path) || path.Contains(".."))
+            throw new ConfigException($"Neplatná cesta '{path}': musí začínat /data/wow/ nebo /profile/wow/");
+        var qs = string.Join("&", (parameters ?? new Dictionary<string, string>()).OrderBy(p => p.Key, StringComparer.Ordinal)
+            .Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
+        var key = Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(
+            $"{_o.Region}|{kind}|{path}|{qs}|{locale ?? _o.Locale}"))).ToLowerInvariant()[..20];
+        var doc = await CachedAsync(Path.Combine(_cache, $"cs-raw-{key}.json"), ttl, refresh, async () =>
+        {
+            var (st, body) = await ApiAsync(path, kind, locale, ct, qs.Length > 0 ? qs : null);
+            if (st == 404) throw new NotFoundException($"Nenalezeno: {path}");
+            if (st != 200 || body is not { } b) throw new UpstreamException($"{path}: HTTP {st}");
+            return new RawDoc(b);
+        }, d => d);
+        return clean ? Tidy(doc.Doc) : doc.Doc;
+    }
+
+    /// <summary>Rulesety (ve Forever místo realmu): 1 PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP.</summary>
+    public async Task<IReadOnlyList<Ruleset>> GetRulesetsAsync(TimeSpan? ttl = null, bool refresh = false,
+        CancellationToken ct = default) =>
+        (await CachedAsync(Path.Combine(_cache, $"cs-rulesets-{_o.Region}.json"), ttl, refresh, async () =>
+        {
+            var (st, b) = await ApiAsync("/data/wow/ruleset/index", "dynamic", "en_GB", ct);
+            if (st != 200 || b is not { } doc) throw new UpstreamException($"Rulesety: HTTP {st}");
+            var ids = Items(doc.Path("rulesets")).Select(r => I(r.Path("id"))).Where(i => i is not null)
+                .Select(i => i!.Value).OrderBy(i => i).ToList();
+            var list = new List<Ruleset>();
+            foreach (var id in ids) list.Add(new Ruleset(id, await NameAsync($"/data/wow/ruleset/{id}", "dynamic", ct)));
+            return new RulesetList(list);
+        }, x => x)).Items;
+
+    private async Task<Ruleset> ResolveRulesetAsync(string? ruleset, CancellationToken ct)
+    {
+        var rs = await GetRulesetsAsync(ct: ct);
+        if (rs.Count == 0) throw new UpstreamException("API nevrátilo žádné rulesety");
+        if (ruleset is null) // data aukcí jsou u všech rulesetů stejná, „Normal“ je rozumný výchozí
+            return rs.FirstOrDefault(r => string.Equals(r.Name, "Normal", StringComparison.OrdinalIgnoreCase)) ?? rs[0];
+        var t = ruleset.Trim();
+        var hit = int.TryParse(t, out var id)
+            ? rs.FirstOrDefault(r => r.Id == id)
+            : rs.FirstOrDefault(r => string.Equals(r.Name, t, StringComparison.OrdinalIgnoreCase));
+        return hit ?? throw new ConfigException(
+            $"Neznámý ruleset '{ruleset}' (platné: {string.Join(", ", rs.Select(r => $"{r.Id}={r.Name}"))})");
+    }
+
+    /// <param name="ruleset">Id ("2") nebo název ("Normal"); výchozí Normal.</param>
+    public async Task<IReadOnlyList<AuctionHouse>> GetAuctionHousesAsync(string? ruleset = null, TimeSpan? ttl = null,
+        bool refresh = false, CancellationToken ct = default)
+    {
+        var rs = await ResolveRulesetAsync(ruleset, ct);
+        return (await CachedAsync(Path.Combine(_cache, $"cs-auchouses-{_o.Region}-{rs.Id}.json"), ttl, refresh, async () =>
+        {
+            var (st, b) = await ApiAsync($"/data/wow/ruleset/{rs.Id}/auctions/", "dynamic", "en_GB", ct); // lomítko na konci je nutné
+            if (st != 200 || b is not { } doc) throw new UpstreamException($"Aukční domy: HTTP {st}");
+            return new HouseList(Items(doc.Path("auctions"))
+                .Select(a => new AuctionHouse(I(a.Path("id")), a.Path("name")?.GetString())).ToList());
+        }, x => x)).Items;
+    }
+
+    /// <summary>
+    /// Nabídky v aukčním domě (<paramref name="house"/> = id, viz <see cref="GetAuctionHousesAsync"/>). Ceny jsou v copperu.
+    /// Celý dům má i stovky tisíc nabídek (desítky MB), proto se cachuje na disk a <paramref name="itemIds"/> (jen tyto
+    /// itemy) a <paramref name="limit"/> se aplikují až na cachovaná data. <paramref name="names"/> doplní ItemName
+    /// (max. 500 různých itemů, každý neznámý je dotaz, pak je v cache). Pozor: data jsou u všech rulesetů stejná
+    /// (zvláštnost API).
+    /// </summary>
+    public async Task<AuctionListing> GetAuctionsAsync(int house, string? ruleset = null,
+        AuctionKind kind = AuctionKind.Auctions, IReadOnlyCollection<int>? itemIds = null, int? limit = null,
+        bool names = false, TimeSpan? ttl = null, bool refresh = false, CancellationToken ct = default)
+    {
+        var rs = await ResolveRulesetAsync(ruleset, ct);
+        var file = Path.Combine(_cache, $"cs-auc-{_o.Region}-{rs.Id}-{house}-{kind.ToString().ToLowerInvariant()}.json");
+        var full = await CachedAsync(file, ttl, refresh, () => FetchAuctionsAsync(rs, house, kind, ct), l => l with { Stale = true });
+
+        IEnumerable<Auction> rows = full.Auctions;
+        if (itemIds is not null)
+        {
+            var want = itemIds.ToHashSet();
+            rows = rows.Where(a => a.ItemId is { } i && want.Contains(i));
+        }
+        var matched = rows.ToList();
+        var returned = limit is { } lim ? matched.Take(Math.Max(0, lim)).ToList() : matched;
+        if (names)
+        {
+            var ids = returned.Select(a => a.ItemId).Where(i => i is not null).Select(i => i!.Value).Distinct().ToList();
+            if (ids.Count > AuctionNamesMax)
+                throw new ConfigException($"names: true u {ids.Count} různých itemů je moc (max {AuctionNamesMax}); zúž výběr přes itemIds nebo limit");
+            var nm = new Dictionary<int, string?>();
+            foreach (var id in ids) nm[id] = await ItemNameAsync(id, ct);
+            FlushItems();
+            returned = returned.Select(a => a with { ItemName = a.ItemId is { } i ? nm.GetValueOrDefault(i) : null }).ToList();
+        }
+        return full with { Matched = matched.Count, Returned = returned.Count, Auctions = returned };
+    }
+
+    private async Task<AuctionListing> FetchAuctionsAsync(Ruleset rs, int house, AuctionKind kind, CancellationToken ct)
+    {
+        var commodity = kind == AuctionKind.Commodities;
+        var (st, b) = await ApiAsync($"/data/wow/ruleset/{rs.Id}/auctions/{house}" + (commodity ? "/commodities" : ""),
+            "dynamic", "en_GB", ct);
+        if (st == 404) throw new NotFoundException($"Aukční dům {house} nenalezen (ruleset {rs.Name})");
+        if (st != 200 || b is not { } doc) throw new UpstreamException($"Aukce: HTTP {st}");
+        var rows = Items(doc.Path("auctions")).Select(a => NormAuction(a, commodity)).ToList();
+        var name = doc.Path("name")?.GetString()
+            ?? (await GetAuctionHousesAsync(rs.Id.ToString(), ct: ct)).FirstOrDefault(h => h.Id == house)?.Name;
+        return new AuctionListing(new AuctionHouse(house, name), rs, kind, rows.Count, rows.Count, rows.Count, rows,
+            DateTimeOffset.UtcNow, false);
+    }
+
+    private static Auction NormAuction(JsonElement a, bool commodity)
+    {
+        static long? L(JsonElement? e) => e is { ValueKind: JsonValueKind.Number } v && v.TryGetInt64(out var l) ? l : null;
+        var item = a.Path("item");
+        var mods = commodity ? null : item?.Path("modifiers");
+        var bonus = commodity ? null : item?.Path("bonus_lists");
+        return new Auction(
+            Id: L(a.Path("id")), ItemId: I(item?.Path("id")), Quantity: I(a.Path("quantity")),
+            Buyout: commodity ? null : L(a.Path("buyout")), Bid: commodity ? null : L(a.Path("bid")),
+            UnitPrice: commodity ? L(a.Path("unit_price")) : null, TimeLeft: a.Path("time_left")?.GetString(),
+            Context: commodity ? null : I(item?.Path("context")),
+            Modifiers: mods is null ? null : Items(mods).Select(m => new ItemModifier(I(m.Path("type")), I(m.Path("value")))).ToList(),
+            BonusLists: bonus is null ? null : Items(bonus).Select(x => I(x)).Where(x => x is not null).Select(x => x!.Value).ToList());
     }
 
     // ---------- interní ----------
@@ -152,8 +301,11 @@ public sealed partial class ForeverClient : IDisposable
             (await ApiAsync($"{baseP}/{path}", "profile", null, ct)) is (200, { } b) ? b : null;
 
         JsonElement? stats = secs.HasFlag(CharacterSections.Stats) ? await Sub("statistics") : null;
-        JsonElement? gear = secs.HasFlag(CharacterSections.Gear) ? await Sub("equipment") : null;
-        JsonElement? profs = secs.HasFlag(CharacterSections.Professions) ? await Sub("professions") : null;
+        // texty detailů itemů a receptů vrací API jen anglicky, proto en_GB
+        JsonElement? gear = secs.HasFlag(CharacterSections.Gear)
+            ? secs.HasFlag(CharacterSections.ItemDetails) ? await SubEn("equipment") : await Sub("equipment") : null;
+        JsonElement? profs = secs.HasFlag(CharacterSections.Professions)
+            ? secs.HasFlag(CharacterSections.Recipes) ? await SubEn("professions") : await Sub("professions") : null;
         JsonElement? media = secs.HasFlag(CharacterSections.Media) ? await Sub("character-media") : null;
         // názvy statistik vrací API jen anglicky, jinak jsou null
         async Task<JsonElement?> SubEn(string path) =>
@@ -167,12 +319,23 @@ public sealed partial class ForeverClient : IDisposable
         JsonElement? pvp = secs.HasFlag(CharacterSections.Pvp) ? await SubEn("pvp-summary") : null;
         JsonElement? pets = secs.HasFlag(CharacterSections.HunterPets) ? await SubEn("hunter-pets") : null; // ne-lovci: 404
         JsonElement? specs = secs.HasFlag(CharacterSections.Specializations) ? await SubEn("specializations") : null;
+        // vracejí se "jak jsou" (bez odkazů, camelCase): null = dotaz selhal, {} = API nic nevrátilo
+        JsonElement? appearance = secs.HasFlag(CharacterSections.Appearance) ? await SubEn("appearance") : null;
+        JsonElement? titles = secs.HasFlag(CharacterSections.Titles) ? await SubEn("titles") : null;
+        JsonElement? mythic = secs.HasFlag(CharacterSections.MythicKeystone) ? await SubEn("mythic-keystone-profile") : null;
+        JsonElement? encDungeons = secs.HasFlag(CharacterSections.Encounters) ? await SubEn("encounters/dungeons") : null;
+        JsonElement? encRaids = secs.HasFlag(CharacterSections.Encounters) ? await SubEn("encounters/raids") : null;
+        var collections = secs.HasFlag(CharacterSections.Collections)
+            ? new[] { await SubEn("collections/mounts"), await SubEn("collections/pets"), await SubEn("collections/toys"),
+                      await SubEn("collections/heirlooms"), await SubEn("collections/transmogs") }
+            : null;
 
         var rulesetId = prof.Path("ruleset", "id")?.GetInt32();
         long? login = prof.Path("last_login_timestamp")?.GetInt64();
 
-        var gearList = gear is null ? null : await BuildGearAsync(gear.Value, secs.HasFlag(CharacterSections.Icons), ct);
-        var profList = profs is null ? null : await BuildProfessionsAsync(profs.Value, ct);
+        var gearList = gear is null ? null
+            : await BuildGearAsync(gear.Value, secs.HasFlag(CharacterSections.Icons), secs.HasFlag(CharacterSections.ItemDetails), ct);
+        var profList = profs is null ? null : await BuildProfessionsAsync(profs.Value, secs.HasFlag(CharacterSections.Recipes), ct);
         var assets = media?.Path("assets")?.EnumerateArray()
             .ToDictionary(a => a.Path("key")!.Value.GetString()!, a => a.Path("value")?.GetString());
 
@@ -188,6 +351,10 @@ public sealed partial class ForeverClient : IDisposable
             Ruleset: rulesetId is { } rid ? await NameAsync($"/data/wow/ruleset/{rid}", "dynamic", ct) : null,
             ItemLevel: prof.Path("equipped_item_level")?.GetInt32(),
             LastLogin: login is { } l ? DateTimeOffset.FromUnixTimeMilliseconds(l) : null,
+            Experience: I(prof.Path("experience")),
+            Gender: prof.Path("gender", "type")?.GetString() is { Length: > 0 } gd ? Title(gd) : null,
+            AchievementPoints: I(prof.Path("achievement_points")),
+            AverageItemLevel: I(prof.Path("average_item_level")),
             Stats: stats is null ? null : BuildStats(stats.Value),
             Gear: gearList,
             Professions: profList,
@@ -198,6 +365,13 @@ public sealed partial class ForeverClient : IDisposable
             Pvp: pvp is null ? null : BuildPvp(pvp.Value),
             HunterPets: pets is null ? null : BuildHunterPets(pets.Value),
             Specializations: specs is null ? null : BuildSpecializations(specs.Value),
+            Collections: collections is null ? null : BuildCollections(collections),
+            Appearance: appearance is null ? null : Tidy(appearance.Value, "character"),
+            Encounters: encDungeons is null && encRaids is null ? null
+                : new EncountersInfo(encDungeons is null ? null : Tidy(encDungeons.Value, "character"),
+                                     encRaids is null ? null : Tidy(encRaids.Value, "character")),
+            Titles: titles is null ? null : Tidy(titles.Value, "character"),
+            MythicKeystone: mythic is null ? null : Tidy(mythic.Value, "character"),
             AvatarUrl: assets?.GetValueOrDefault("avatar"),
             RenderUrl: assets?.GetValueOrDefault("main-sd-raw"),
             FetchedAt: DateTimeOffset.UtcNow,
@@ -213,21 +387,82 @@ public sealed partial class ForeverClient : IDisposable
     private static IEnumerable<JsonElement> Items(JsonElement? e) =>
         e is { ValueKind: JsonValueKind.Array } a ? a.EnumerateArray() : [];
 
+    // ---------- úprava odpovědí API: bez odkazů, klíče v camelCase ----------
+
+    private static readonly Regex SnakeRe = new("_([a-z0-9])", RegexOptions.Compiled);
+
+    private static string CamelKey(string k) => SnakeRe.Replace(k, m => m.Groups[1].Value.ToUpperInvariant());
+
+    /// <summary>
+    /// Odpověď API bez odkazů (<c>_links</c>, <c>key: {href}</c>, <c>{href}</c>) a s klíči v camelCase. Hodnoty zůstávají
+    /// beze změny, nic se neztrácí. <paramref name="dropTop"/> = další klíče na nejvyšší úrovni, které se vynechají.
+    /// </summary>
+    internal static JsonElement Tidy(JsonElement e, params string[] dropTop)
+    {
+        System.Text.Json.Nodes.JsonNode? Rec(JsonElement x, bool top)
+        {
+            switch (x.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    var o = new System.Text.Json.Nodes.JsonObject();
+                    foreach (var p in x.EnumerateObject())
+                    {
+                        if (p.Name == "_links" || (top && dropTop.Contains(p.Name))) continue;
+                        if (p.Name == "key" && p.Value.ValueKind == JsonValueKind.Object && p.Value.TryGetProperty("href", out _)) continue;
+                        if (p.Value.ValueKind == JsonValueKind.Object && p.Value.EnumerateObject().Count() == 1
+                            && p.Value.TryGetProperty("href", out _)) continue;
+                        o[CamelKey(p.Name)] = Rec(p.Value, false);
+                    }
+                    return o;
+                case JsonValueKind.Array:
+                    var a = new System.Text.Json.Nodes.JsonArray();
+                    foreach (var v in x.EnumerateArray()) a.Add(Rec(v, false));
+                    return a;
+                default:
+                    return System.Text.Json.Nodes.JsonNode.Parse(x.GetRawText());
+            }
+        }
+        return JsonSerializer.SerializeToElement(Rec(e, true));
+    }
+
+    private static CollectionsInfo? BuildCollections(JsonElement?[] docs)
+    {
+        if (docs.All(d => d is null)) return null;
+        JsonElement? mountsD = docs[0], petsD = docs[1], toysD = docs[2], heirD = docs[3], tmD = docs[4];
+        (int? Id, string? Name) Ref(JsonElement x, string k) => (I(x.Path(k, "id")), x.Path(k, "name")?.GetString());
+        return new CollectionsInfo(
+            Mounts: mountsD is null ? null : Items(mountsD.Value.Path("mounts")).Select(m =>
+                { var (id, nm) = Ref(m, "mount"); return new MountRef(id, nm, B(m.Path("is_useable"))); }).ToList(),
+            Pets: petsD is null ? null : Items(petsD.Value.Path("pets")).Select(p => Tidy(p)).ToList(),
+            UnlockedBattlePetSlots: petsD is null ? null : I(petsD.Value.Path("unlocked_battle_pet_slots")),
+            Toys: toysD is null ? null : Items(toysD.Value.Path("toys")).Select(t =>
+                { var (id, nm) = Ref(t, "toy"); return new ToyRef(id, nm); }).ToList(),
+            Heirlooms: heirD is null ? null
+                : heirD.Value.Path("heirlooms") is { } h ? Tidy(h) : JsonSerializer.SerializeToElement(Array.Empty<int>()),
+            Transmogs: tmD is null ? null : Items(tmD.Value.Path("slots")).Select(s => new TransmogSlot(
+                s.Path("slot", "type")?.GetString(),
+                Items(s.Path("appearances")).Select(a => I(a.Path("id"))).Where(i => i is not null).Select(i => i!.Value).ToList())).ToList());
+    }
+
     private static AchievementsInfo? BuildAchievements(JsonElement doc)
     {
         if (doc.Path("achievements") is null && doc.Path("total_quantity") is null) return null;
         var completed = new List<AchievementEntry>();
+        var inProgress = new List<InProgressAchievement>();
         foreach (var a in Items(doc.Path("achievements")))
-            if (Ms(a.Path("completed_timestamp")) is { } at)
-                completed.Add(new AchievementEntry(I(a.Path("achievement", "id")) ?? I(a.Path("id")),
-                    a.Path("achievement", "name")?.GetString(), at));
+        {
+            var id = I(a.Path("achievement", "id")) ?? I(a.Path("id"));
+            var nm = a.Path("achievement", "name")?.GetString();
+            if (Ms(a.Path("completed_timestamp")) is { } at) completed.Add(new AchievementEntry(id, nm, at));
+            else inProgress.Add(new InProgressAchievement(id, nm, a.Path("criteria") is { } cr ? Tidy(cr) : null));
+        }
         completed = completed.OrderBy(x => x.CompletedAt).ToList();
         var recent = Items(doc.Path("recent_events")).Select(e => new RecentAchievement(
             I(e.Path("achievement", "id")), e.Path("achievement", "name")?.GetString(), Ms(e.Path("timestamp")))).ToList();
         var cats = Items(doc.Path("category_progress")).Select(c => new AchievementCategory(
             I(c.Path("category", "id")), c.Path("category", "name")?.GetString(), I(c.Path("quantity")), I(c.Path("points")))).ToList();
         return new AchievementsInfo(I(doc.Path("total_quantity")) ?? completed.Count, I(doc.Path("total_points")) ?? 0,
-            completed, recent, cats);
+            completed, recent, cats, inProgress);
     }
 
     private static List<Reputation>? BuildReputations(JsonElement doc)
@@ -332,7 +567,7 @@ public sealed partial class ForeverClient : IDisposable
         return v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
     }
 
-    private async Task<List<GearItem>> BuildGearAsync(JsonElement eq, bool icons, CancellationToken ct)
+    private async Task<List<GearItem>> BuildGearAsync(JsonElement eq, bool icons, bool details, CancellationToken ct)
     {
         var list = new List<GearItem>();
         if (eq.Path("equipped_items") is not { ValueKind: JsonValueKind.Array } arr) return list;
@@ -343,7 +578,8 @@ public sealed partial class ForeverClient : IDisposable
             list.Add(new GearItem(
                 Title((it.Path("slot", "type")?.GetString() ?? "").Replace('_', ' ')), id, nm,
                 Title(it.Path("quality", "type")?.GetString() ?? ""), it.Path("level", "value")?.GetInt32(),
-                icons ? await ItemIconAsync(id, ct) : null));
+                icons ? await ItemIconAsync(id, ct) : null,
+                details ? Tidy(it) : null)); // celý záznam itemu z API, nic se nezahazuje
         }
         FlushItems();
         FlushIcons();
@@ -386,7 +622,7 @@ public sealed partial class ForeverClient : IDisposable
         }
     }
 
-    private async Task<List<Profession>> BuildProfessionsAsync(JsonElement pr, CancellationToken ct)
+    private async Task<List<Profession>> BuildProfessionsAsync(JsonElement pr, bool recipes, CancellationToken ct)
     {
         var list = new List<Profession>();
         foreach (var grp in new[] { "primaries", "secondaries" })
@@ -403,7 +639,21 @@ public sealed partial class ForeverClient : IDisposable
                     }
                 var pid = x.Path("profession", "id")!.Value.GetInt32();
                 var nm = x.Path("profession", "name")?.GetString() ?? await NameAsync($"/data/wow/profession/{pid}", "static", ct);
-                list.Add(new Profession(nm, grp == "primaries", skill, max));
+                List<ProfessionTier>? tierList = null;
+                List<Recipe>? recipeList = null;
+                if (recipes)
+                {
+                    tierList = [];
+                    recipeList = [];
+                    foreach (var t in Items(x.Path("tiers")))
+                    {
+                        var tn = t.Path("tier", "name")?.GetString();
+                        tierList.Add(new ProfessionTier(I(t.Path("tier", "id")), tn, I(t.Path("skill_points")) ?? 0, I(t.Path("max_skill_points")) ?? 0));
+                        foreach (var r in Items(t.Path("known_recipes")))
+                            recipeList.Add(new Recipe(I(r.Path("id")), r.Path("name")?.GetString(), tn));
+                    }
+                }
+                list.Add(new Profession(nm, grp == "primaries", skill, max, tierList, recipeList));
             }
         }
         return list;
@@ -414,10 +664,12 @@ public sealed partial class ForeverClient : IDisposable
 
     // ---------- HTTP ----------
 
-    private async Task<(int Status, JsonElement? Body)> ApiAsync(string path, string kind, string? locale, CancellationToken ct)
+    private async Task<(int Status, JsonElement? Body)> ApiAsync(string path, string kind, string? locale,
+        CancellationToken ct, string? query = null)
     {
         var token = await TokenAsync(ct);
-        var url = $"https://{_o.Region}.api.blizzard.com{path}?namespace={kind}-forever-{_o.Region}&locale={locale ?? _o.Locale}";
+        var url = $"https://{_o.Region}.api.blizzard.com{path}?namespace={kind}-forever-{_o.Region}&locale={locale ?? _o.Locale}"
+            + (query is null ? "" : "&" + query);
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         try
