@@ -39,6 +39,20 @@ try
     if (c.Professions is { } p) Console.WriteLine("profese: " + string.Join(", ", p.Select(x => $"{x.Name} {x.Skill}/{x.MaxSkill}")));
     if (c.Lifetime is { } lt)
         Console.WriteLine($"za celou dobu: smrtí {lt.Highlights["deaths"]} (pády {lt.Highlights["deathsFalling"]}, od hráčů {lt.Highlights["deathsFromPlayers"]}), zabití {lt.Highlights["totalKills"]}, questů {lt.Highlights["questsCompleted"]} [{lt.All.Count} statistik]");
+    if (c.Achievements is { } ac)
+        Console.WriteLine($"úspěchy: {ac.Total} splněných" + (ac.Completed.Count > 0 ? $", poslední „{ac.Completed[^1].Name}“ {ac.Completed[^1].CompletedAt:yyyy-MM-dd}" : ""));
+    if (c.Reputations is { } rp)
+        Console.WriteLine($"reputace: {rp.Count} frakcí" + (rp.Count > 0 ? $", nejvyšší {rp[0].Name} ({rp[0].Standing})" : ""));
+    if (c.Quests is { } qs)
+        Console.WriteLine($"questy: splněno {qs.CompletedCount?.ToString() ?? "?"}, rozpracováno {qs.InProgress.Count}");
+    if (c.Pvp is { } pv)
+        Console.WriteLine($"PvP: {pv.HonorableKills} čestných zabití, hodnost {pv.Rank}, battlegroundů {pv.Battlegrounds.Count}");
+    if (c.HunterPets is { } hp)
+        Console.WriteLine("peti: " + (hp.Count == 0 ? "žádní" : string.Join(", ", hp.Select(x => $"{x.Name} ({x.Creature}, lvl {x.Level})"))));
+    if (c.Specializations is { } sp)
+        Console.WriteLine("talenty: " + string.Join("; ", sp.SelectMany(g => g.Specializations).Select(x => $"{x.Name} {x.Points} bodů ({x.Talents.Count} talentů)")));
+    if (c.Gear is { } gi && gi.Any(i => i.IconUrl is not null))
+        Console.WriteLine($"ikony: {gi.Count(i => i.IconUrl is not null)} z {gi.Count}, např. {gi.First(i => i.IconUrl is not null).IconUrl}");
     Console.WriteLine($"avatar: {c.AvatarUrl ?? "-"} | stale: {c.Stale}");
     return 0;
 }

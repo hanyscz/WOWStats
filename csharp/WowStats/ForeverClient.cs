@@ -30,6 +30,8 @@ public sealed partial class ForeverClient : IDisposable
     private Dictionary<string, string?>? _names;
     private Dictionary<string, ItemEntry>? _items;
     private bool _itemsDirty;
+    private Dictionary<string, IconEntry>? _icons;
+    private bool _iconsDirty;
     private readonly SemaphoreSlim _whGate = new(1, 1);
     private DateTimeOffset _whLast = DateTimeOffset.MinValue;
 
@@ -53,11 +55,12 @@ public sealed partial class ForeverClient : IDisposable
     // ---------- veřejné API ----------
 
     /// <param name="name">Slug nebo "Jmeno Prijmeni".</param>
-    public async Task<Character> GetCharacterAsync(string name, CharacterSections sections = CharacterSections.All,
+    public async Task<Character> GetCharacterAsync(string name, CharacterSections sections = CharacterSections.Default,
         TimeSpan? ttl = null, bool refresh = false, CancellationToken ct = default)
     {
         var slug = name.Trim().ToLowerInvariant().Replace(' ', '-');
         if (!SlugRe().IsMatch(slug)) throw new CharacterNotFoundException($"Neplatné jméno postavy: '{name}'");
+        if (sections.HasFlag(CharacterSections.Icons)) sections |= CharacterSections.Gear; // ikony se přidávají k vybavení
 
         var file = Path.Combine(_cache, $"cs-char-{_o.Region}-{slug}-{(int)sections}.json");
         return await CachedAsync(file, ttl, refresh, () => FetchAsync(slug, sections, ct), c => c with { Stale = true });
@@ -153,14 +156,22 @@ public sealed partial class ForeverClient : IDisposable
         JsonElement? profs = secs.HasFlag(CharacterSections.Professions) ? await Sub("professions") : null;
         JsonElement? media = secs.HasFlag(CharacterSections.Media) ? await Sub("character-media") : null;
         // názvy statistik vrací API jen anglicky, jinak jsou null
-        JsonElement? lifetime = secs.HasFlag(CharacterSections.Lifetime)
-            ? (await ApiAsync($"{baseP}/achievements/statistics", "profile", "en_GB", ct)) is (200, { } lt) ? lt : null
-            : null;
+        async Task<JsonElement?> SubEn(string path) =>
+            (await ApiAsync($"{baseP}/{path}", "profile", "en_GB", ct)) is (200, { } b) ? b : null;
+        JsonElement? lifetime = secs.HasFlag(CharacterSections.Lifetime) ? await SubEn("achievements/statistics") : null;
+        // u dalších sekcí vrací API názvy také jen anglicky, proto en_GB
+        JsonElement? ach = secs.HasFlag(CharacterSections.Achievements) ? await SubEn("achievements") : null;
+        JsonElement? reps = secs.HasFlag(CharacterSections.Reputations) ? await SubEn("reputations") : null;
+        JsonElement? questsIn = secs.HasFlag(CharacterSections.Quests) ? await SubEn("quests") : null;
+        JsonElement? questsDone = secs.HasFlag(CharacterSections.Quests) ? await SubEn("quests/completed") : null;
+        JsonElement? pvp = secs.HasFlag(CharacterSections.Pvp) ? await SubEn("pvp-summary") : null;
+        JsonElement? pets = secs.HasFlag(CharacterSections.HunterPets) ? await SubEn("hunter-pets") : null; // ne-lovci: 404
+        JsonElement? specs = secs.HasFlag(CharacterSections.Specializations) ? await SubEn("specializations") : null;
 
         var rulesetId = prof.Path("ruleset", "id")?.GetInt32();
         long? login = prof.Path("last_login_timestamp")?.GetInt64();
 
-        var gearList = gear is null ? null : await BuildGearAsync(gear.Value, ct);
+        var gearList = gear is null ? null : await BuildGearAsync(gear.Value, secs.HasFlag(CharacterSections.Icons), ct);
         var profList = profs is null ? null : await BuildProfessionsAsync(profs.Value, ct);
         var assets = media?.Path("assets")?.EnumerateArray()
             .ToDictionary(a => a.Path("key")!.Value.GetString()!, a => a.Path("value")?.GetString());
@@ -181,10 +192,99 @@ public sealed partial class ForeverClient : IDisposable
             Gear: gearList,
             Professions: profList,
             Lifetime: lifetime is null ? null : BuildLifetime(lifetime.Value),
+            Achievements: ach is null ? null : BuildAchievements(ach.Value),
+            Reputations: reps is null ? null : BuildReputations(reps.Value),
+            Quests: secs.HasFlag(CharacterSections.Quests) ? BuildQuests(questsIn, questsDone) : null,
+            Pvp: pvp is null ? null : BuildPvp(pvp.Value),
+            HunterPets: pets is null ? null : BuildHunterPets(pets.Value),
+            Specializations: specs is null ? null : BuildSpecializations(specs.Value),
             AvatarUrl: assets?.GetValueOrDefault("avatar"),
             RenderUrl: assets?.GetValueOrDefault("main-sd-raw"),
             FetchedAt: DateTimeOffset.UtcNow,
             Stale: false);
+    }
+
+    // ---------- nové sekce (stejné tvary jako v Pythonu) ----------
+
+    private static int? I(JsonElement? e) => e is { ValueKind: JsonValueKind.Number } v && v.TryGetInt32(out var i) ? i : null;
+    private static bool B(JsonElement? e) => e is { ValueKind: JsonValueKind.True };
+    private static DateTimeOffset? Ms(JsonElement? e) =>
+        e is { ValueKind: JsonValueKind.Number } v && v.TryGetInt64(out var ms) && ms != 0 ? DateTimeOffset.FromUnixTimeMilliseconds(ms) : null;
+    private static IEnumerable<JsonElement> Items(JsonElement? e) =>
+        e is { ValueKind: JsonValueKind.Array } a ? a.EnumerateArray() : [];
+
+    private static AchievementsInfo? BuildAchievements(JsonElement doc)
+    {
+        if (doc.Path("achievements") is null && doc.Path("total_quantity") is null) return null;
+        var completed = new List<AchievementEntry>();
+        foreach (var a in Items(doc.Path("achievements")))
+            if (Ms(a.Path("completed_timestamp")) is { } at)
+                completed.Add(new AchievementEntry(I(a.Path("achievement", "id")) ?? I(a.Path("id")),
+                    a.Path("achievement", "name")?.GetString(), at));
+        completed = completed.OrderBy(x => x.CompletedAt).ToList();
+        var recent = Items(doc.Path("recent_events")).Select(e => new RecentAchievement(
+            I(e.Path("achievement", "id")), e.Path("achievement", "name")?.GetString(), Ms(e.Path("timestamp")))).ToList();
+        var cats = Items(doc.Path("category_progress")).Select(c => new AchievementCategory(
+            I(c.Path("category", "id")), c.Path("category", "name")?.GetString(), I(c.Path("quantity")), I(c.Path("points")))).ToList();
+        return new AchievementsInfo(I(doc.Path("total_quantity")) ?? completed.Count, I(doc.Path("total_points")) ?? 0,
+            completed, recent, cats);
+    }
+
+    private static List<Reputation>? BuildReputations(JsonElement doc)
+    {
+        if (doc.Path("reputations") is not { ValueKind: JsonValueKind.Array } arr) return null;
+        return arr.EnumerateArray().Select(r => new Reputation(
+                I(r.Path("faction", "id")), r.Path("faction", "name")?.GetString(), r.Path("standing", "name")?.GetString(),
+                I(r.Path("standing", "tier")), I(r.Path("standing", "value")), I(r.Path("standing", "max")), I(r.Path("standing", "raw"))))
+            .OrderByDescending(x => x.Tier ?? -1).ThenBy(x => x.Name ?? "", StringComparer.Ordinal).ToList(); // tier sestupně, pak název
+    }
+
+    private static QuestsInfo? BuildQuests(JsonElement? inProgress, JsonElement? done)
+    {
+        var ip = inProgress?.Path("in_progress");
+        var dn = done?.Path("quests");
+        if (ip is not { ValueKind: JsonValueKind.Array } && dn is not { ValueKind: JsonValueKind.Array }) return null;
+        List<QuestRef> Refs(JsonElement? a) => Items(a).Select(q => new QuestRef(I(q.Path("id")), q.Path("name")?.GetString())).ToList();
+        var completed = dn is { ValueKind: JsonValueKind.Array } ? Refs(dn) : null; // null = seznam se nepodařilo získat
+        return new QuestsInfo(completed?.Count, completed, Refs(ip));
+    }
+
+    private static PvpInfo? BuildPvp(JsonElement doc)
+    {
+        if (doc.Path("honorable_kills") is null && doc.Path("pvp_map_statistics") is null) return null;
+        var bgs = Items(doc.Path("pvp_map_statistics")).Select(m => new BattlegroundStat(
+            I(m.Path("world_map", "id")), m.Path("world_map", "name")?.GetString(), I(m.Path("match_statistics", "played")) ?? 0,
+            I(m.Path("match_statistics", "won")) ?? 0, I(m.Path("match_statistics", "lost")) ?? 0)).ToList();
+        return new PvpInfo(I(doc.Path("honorable_kills")) ?? 0, I(doc.Path("pvp_rank")) ?? 0, bgs);
+    }
+
+    private static List<HunterPet>? BuildHunterPets(JsonElement doc)
+    {
+        if (doc.Path("hunter_pets") is not { ValueKind: JsonValueKind.Array } arr) return null;
+        return arr.EnumerateArray().Select(p => new HunterPet(
+            p.Path("name")?.GetString(), I(p.Path("level")), I(p.Path("slot")), B(p.Path("is_active")), B(p.Path("is_summoned")),
+            I(p.Path("creature", "id")), p.Path("creature", "name")?.GetString())).ToList();
+    }
+
+    private static List<SpecializationGroup>? BuildSpecializations(JsonElement doc)
+    {
+        if (doc.Path("specialization_groups") is not { ValueKind: JsonValueKind.Array } groups) return null;
+        var result = new List<SpecializationGroup>();
+        foreach (var g in groups.EnumerateArray())
+        {
+            var specs = new List<Specialization>();
+            foreach (var s in Items(g.Path("specializations")))
+            {
+                var talents = Items(s.Path("talents")).Select(t => new Talent(
+                    I(t.Path("talent", "id")), t.Path("talent", "name")?.GetString(), I(t.Path("talent_rank")),
+                    I(t.Path("spell_tooltip", "spell", "id")), t.Path("spell_tooltip", "description")?.GetString())).ToList();
+                specs.Add(new Specialization(I(s.Path("specialization", "id")),
+                    s.Path("specialization", "name")?.GetString() ?? s.Path("specialization_name")?.GetString(),
+                    I(s.Path("spent_points")) ?? talents.Sum(t => t.Rank ?? 0), talents));
+            }
+            result.Add(new SpecializationGroup(B(g.Path("is_active")), specs));
+        }
+        return result;
     }
 
     private static LifetimeStats? BuildLifetime(JsonElement doc)
@@ -232,7 +332,7 @@ public sealed partial class ForeverClient : IDisposable
         return v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
     }
 
-    private async Task<List<GearItem>> BuildGearAsync(JsonElement eq, CancellationToken ct)
+    private async Task<List<GearItem>> BuildGearAsync(JsonElement eq, bool icons, CancellationToken ct)
     {
         var list = new List<GearItem>();
         if (eq.Path("equipped_items") is not { ValueKind: JsonValueKind.Array } arr) return list;
@@ -242,10 +342,48 @@ public sealed partial class ForeverClient : IDisposable
             var nm = it.Path("name")?.GetString() ?? await ItemNameAsync(id, ct);
             list.Add(new GearItem(
                 Title((it.Path("slot", "type")?.GetString() ?? "").Replace('_', ' ')), id, nm,
-                Title(it.Path("quality", "type")?.GetString() ?? ""), it.Path("level", "value")?.GetInt32()));
+                Title(it.Path("quality", "type")?.GetString() ?? ""), it.Path("level", "value")?.GetInt32(),
+                icons ? await ItemIconAsync(id, ct) : null));
         }
         FlushItems();
+        FlushIcons();
         return list;
+    }
+
+    // ---------- ikony itemů: Blizzard /data/wow/media/item/{id}, trvale cachované v icons.json (sdílí se s Pythonem) ----------
+
+    private sealed record IconEntry(string? Url, double T);
+
+    private async Task<string?> ItemIconAsync(int id, CancellationToken ct)
+    {
+        var key = id.ToString();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        lock (_lock)
+        {
+            _icons ??= ReadJson<Dictionary<string, IconEntry>>(Path.Combine(_cache, "icons.json")) ?? [];
+            // známá ikona se nikdy nepřeptává; nenalezený item až po NegTtl
+            if (_icons.TryGetValue(key, out var e) && (!string.IsNullOrEmpty(e.Url) || now - e.T < NegTtl.TotalSeconds))
+                return e.Url;
+        }
+
+        var (st, body) = await ApiAsync($"/data/wow/media/item/{id}", "static", "en_GB", ct);
+        string? url = null;
+        if (st == 200)
+            foreach (var a in Items(body?.Path("assets")))
+                if (a.Path("key")?.GetString() == "icon") { url = a.Path("value")?.GetString(); break; }
+        if (!string.IsNullOrEmpty(url) || st == 404) // dočasné chyby se necachují
+            lock (_lock) { _icons![key] = new IconEntry(url, now); _iconsDirty = true; }
+        return url;
+    }
+
+    private void FlushIcons()
+    {
+        lock (_lock)
+        {
+            if (!_iconsDirty) return;
+            WriteJson(Path.Combine(_cache, "icons.json"), _icons);
+            _iconsDirty = false;
+        }
     }
 
     private async Task<List<Profession>> BuildProfessionsAsync(JsonElement pr, CancellationToken ct)

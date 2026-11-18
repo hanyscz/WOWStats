@@ -35,6 +35,31 @@ LIFETIME = {"categories": [
                                      {"id": 1336, "name": "Creature type killed the most", "quantity": 20.5,
                                       "description": "Beasts"}]},
 ]}
+ACHIEVEMENTS = {
+    "total_quantity": 2, "total_points": 10,
+    "achievements": [
+        {"id": 2, "achievement": {"id": 2, "name": "Second"}, "completed_timestamp": 1700000200000},
+        {"id": 1, "achievement": {"id": 1, "name": "First"}, "completed_timestamp": 1700000100000},
+        {"id": 3, "achievement": {"id": 3, "name": "In progress"}, "criteria": {"id": 9, "is_completed": False}},
+    ],
+    "recent_events": [{"achievement": {"id": 2, "name": "Second"}, "timestamp": 1700000200000}],
+    "category_progress": [{"category": {"id": 7, "name": "Adventure"}, "quantity": 2, "points": 10}],
+}
+REPUTATIONS = {"reputations": [
+    {"faction": {"id": 1, "name": "Zeta"}, "standing": {"raw": 100, "value": 100, "max": 3000, "tier": 3, "name": "Neutral"}},
+    {"faction": {"id": 2, "name": "Alpha"}, "standing": {"raw": 20000, "value": 8000, "max": 12000, "tier": 5, "name": "Honored"}},
+    {"faction": {"id": 3, "name": "Beta"}, "standing": {"raw": 0, "value": 0, "max": 3000, "tier": 3, "name": "Neutral"}},
+]}
+QUESTS_IN = {"in_progress": [{"id": 5, "name": "Open quest"}], "completed": {"href": "x"}}
+QUESTS_DONE = {"quests": [{"id": 1, "name": "Done A"}, {"id": 2, "name": "Done B"}]}
+PVP = {"honorable_kills": 834, "pvp_rank": 1, "pvp_map_statistics": [
+    {"world_map": {"id": 489, "name": "Warsong Gulch"}, "match_statistics": {"played": 11, "won": 3, "lost": 8}}]}
+PETS = {"hunter_pets": [{"name": "Rex", "level": 35, "slot": 0, "is_active": True, "is_summoned": False,
+                         "creature": {"id": 3241, "name": "Savannah Patriarch"}}]}
+SPECS = {"specialization_groups": [{"is_active": True, "specializations": [{
+    "specialization": {"id": 50, "name": "Beast Mastery"}, "spent_points": 26,
+    "talents": [{"talent": {"id": 10, "name": "Deadly Aspects"}, "talent_rank": 5,
+                 "spell_tooltip": {"spell": {"id": 19552, "name": "Deadly Aspects"}, "description": "Passive"}}]}]}]}
 MEDIA = {"assets": [{"key": "avatar", "value": "https://example.test/a.jpg"},
                     {"key": "main-sd-raw", "value": "https://example.test/m.png"}]}
 GUILD = {"id": 7, "name": "Test Guild", "faction": {"type": "HORDE"}, "member_count": 3,
@@ -57,6 +82,9 @@ class Fake:
         self.items, self.wowhead, self.profile_status = items or {}, wowhead or {}, profile_status
         self.guild_status = guild_status
         self.lifetime_ok = True
+        self.hunter_ok = True
+        self.icons = {1: "https://example.test/i1.jpg"}  # id itemu -> url ikony (ostatni = 404)
+        self.icon_errors = set()                          # id itemu, u kterych se simuluje sitova chyba
         self.calls = []
 
     def count(self, part):
@@ -77,6 +105,12 @@ class Fake:
                   "/data/wow/playable-race/5": "Undead"}
         if path in static:
             return 200, {"name": static[path]}
+        if path.startswith("/data/wow/media/item/"):
+            iid = int(path.rsplit("/", 1)[1])
+            if iid in self.icon_errors:
+                return -1, "boom"
+            url = self.icons.get(iid)
+            return (200, {"assets": [{"key": "icon", "value": url}]}) if url else (404, None)
         if path.startswith("/data/wow/item/"):
             n = self.items.get(int(path.rsplit("/", 1)[1]))
             return (200, {"name": n}) if n else (404, None)
@@ -88,7 +122,11 @@ class Fake:
         if path == base:
             return (200, PROFILE) if self.profile_status == 200 else (self.profile_status, None)
         sub = {"/equipment": EQUIPMENT, "/statistics": STATS, "/professions": PROFESSIONS,
-               "/character-media": MEDIA, "/achievements/statistics": LIFETIME}
+               "/character-media": MEDIA, "/achievements/statistics": LIFETIME, "/achievements": ACHIEVEMENTS,
+               "/reputations": REPUTATIONS, "/quests": QUESTS_IN, "/quests/completed": QUESTS_DONE,
+               "/pvp-summary": PVP, "/hunter-pets": PETS, "/specializations": SPECS}
+        if path.endswith("/hunter-pets") and not self.hunter_ok:
+            return 404, None
         if path.endswith("/achievements/statistics") and not self.lifetime_ok:
             return 500, None
         if path.startswith(base) and path[len(base):] in sub:
@@ -141,6 +179,98 @@ class ClientTests(unittest.TestCase):
         call = next(u for u in self.fake.calls if "achievements/statistics" in u)
         self.assertIn("locale=en_GB", call)
         self.assertNotIn("stats", c)
+
+    # --- dalsi sekce (na vyzadani) ---
+    NEW_KEYS = ("achievements", "reputations", "quests", "pvp", "hunterPets", "specializations")
+
+    def test_default_sections_do_not_include_new_ones(self):
+        c = self.client().get_character("test-char")
+        for k in self.NEW_KEYS:
+            self.assertNotIn(k, c)
+        self.assertNotIn("iconUrl", c["gear"][0])
+        self.assertEqual(self.fake.count("/pvp-summary"), 0)
+        self.assertEqual(self.fake.count("/media/item/"), 0)
+
+    def test_all_new_sections(self):
+        c = self.client(locale="cs_CZ").get_character("test-char", sections="all")
+        a = c["achievements"]
+        self.assertEqual((a["total"], a["points"]), (2, 10))
+        self.assertEqual([x["name"] for x in a["completed"]], ["First", "Second"])  # podle casu, bez rozpracovanych
+        self.assertTrue(a["completed"][0]["completedAt"].startswith("2023-11-14T22:15"))
+        self.assertEqual((a["recent"][0]["name"], a["categories"][0]["name"]), ("Second", "Adventure"))
+        self.assertEqual([r["name"] for r in c["reputations"]], ["Alpha", "Beta", "Zeta"])  # tier sestupne, pak nazev
+        self.assertEqual((c["reputations"][0]["standing"], c["reputations"][0]["value"], c["reputations"][0]["max"]),
+                         ("Honored", 8000, 12000))
+        q = c["quests"]
+        self.assertEqual((q["completedCount"], [x["name"] for x in q["completed"]], q["inProgress"]),
+                         (2, ["Done A", "Done B"], [{"id": 5, "name": "Open quest"}]))
+        self.assertEqual(c["pvp"], {"honorableKills": 834, "rank": 1, "battlegrounds": [
+            {"id": 489, "name": "Warsong Gulch", "played": 11, "won": 3, "lost": 8}]})
+        self.assertEqual(c["hunterPets"], [{"name": "Rex", "level": 35, "slot": 0, "active": True, "summoned": False,
+                                            "creatureId": 3241, "creature": "Savannah Patriarch"}])
+        spec = c["specializations"][0]["specializations"][0]
+        self.assertTrue(c["specializations"][0]["active"])
+        self.assertEqual((spec["name"], spec["points"], spec["talents"][0]["spellId"], spec["talents"][0]["rank"]),
+                         ("Beast Mastery", 26, 19552, 5))
+        self.assertTrue(all("iconUrl" in g for g in c["gear"]))  # "all" zahrnuje i ikony
+        # nazvy jsou jen anglicky, i kdyz klient pouziva cs_CZ
+        for part in ("/achievements?", "/reputations?", "/quests?", "/quests/completed?", "/pvp-summary?",
+                     "/hunter-pets?", "/specializations?"):
+            self.assertIn("locale=en_GB", next(u for u in self.fake.calls if part in u), part)
+
+    def test_sections_as_comma_string(self):
+        c = self.client().get_character("test-char", sections="pvp, reputations")
+        self.assertEqual(set(c) & set(self.NEW_KEYS), {"pvp", "reputations"})
+        self.assertNotIn("stats", c)
+
+    def test_hunter_pets_none_for_non_hunters(self):
+        self.fake.hunter_ok = False
+        self.assertIsNone(self.client().get_character("test-char", sections=["hunterPets"])["hunterPets"])
+
+    def test_quests_list_failure_gives_none_not_zero(self):
+        orig = self.fake.__call__
+
+        def broken(url, *a, **k):
+            return (500, None) if "/quests/completed" in url else orig(url, *a, **k)
+        m._http = broken
+        q = self.client().get_character("test-char", sections=["quests"])["quests"]
+        self.assertIsNone(q["completed"])
+        self.assertIsNone(q["completedCount"])
+        self.assertEqual(len(q["inProgress"]), 1)
+
+    def test_icons_imply_gear_and_are_cached(self):
+        c = self.client().get_character("test-char", sections=["icons"])  # bez "gear"
+        self.assertEqual([g["iconUrl"] for g in c["gear"]], ["https://example.test/i1.jpg", None])
+        self.assertEqual(self.fake.count("/media/item/"), 2)
+        self.client().get_character("test-char", sections=["icons"], refresh=True)  # novy "proces"
+        self.assertEqual(self.fake.count("/media/item/"), 2)  # znama ikona i nenalezeny item (404) se nepreptavaji
+
+    def test_icon_negative_cache_expires_and_network_error_is_not_cached(self):
+        self.client().get_character("test-char", sections=["icons"])
+        cache = json.loads((self.tmp / "icons.json").read_text(encoding="utf-8"))
+        self.assertEqual(cache["2"]["url"], None)
+        cache["2"]["t"] = time.time() - 8 * 86400
+        (self.tmp / "icons.json").write_text(json.dumps(cache), encoding="utf-8")
+        self.client().get_character("test-char", sections=["icons"], refresh=True)
+        self.assertEqual(self.fake.count("/media/item/2"), 2)  # po 7 dnech se zkusi znovu
+        self.fake.icon_errors = {1}
+        (self.tmp / "icons.json").unlink()
+        self.client().get_character("test-char", sections=["icons"], refresh=True)
+        self.assertNotIn("1", json.loads((self.tmp / "icons.json").read_text(encoding="utf-8")))  # chyba site se necachuje
+
+    def test_unknown_section_lists_valid_ones(self):
+        with self.assertRaises(ConfigError) as cm:
+            self.client().get_character("test-char", sections="stats,bogus")
+        self.assertIn("bogus", str(cm.exception))
+        self.assertIn("achievements", str(cm.exception))
+
+    def test_cli_sections_all(self):
+        args = ["--env-file", "nonexist", "--client-id", "id123456789", "--client-secret", "s"]
+        with mock.patch.dict(os.environ, {"WOWSTATS_CACHE_DIR": str(self.tmp)}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(["character", "test-char", "--sections", "all", *args]), 0)
+        self.assertIn("achievements", json.loads(out.getvalue()))
 
     def test_lifetime_missing_when_api_fails(self):
         self.fake.lifetime_ok = False

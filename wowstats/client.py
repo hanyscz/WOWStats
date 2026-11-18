@@ -17,9 +17,17 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-ALL_SECTIONS = ("stats", "gear", "professions", "media", "lifetime")
+# Vychozi sekce (to, co vraci get_character bez dalsiho nastaveni) a vsechny dostupne sekce.
+# Dalsi sekce jsou "na vyzadani": kazda znamena aspon jeden HTTP dotaz navic na postavu.
+DEFAULT_SECTIONS = ("stats", "gear", "professions", "media", "lifetime")
+ALL_SECTIONS = DEFAULT_SECTIONS + ("achievements", "reputations", "quests", "pvp", "hunterPets", "specializations",
+                                   "icons")
 _SUBDOC = {"stats": "statistics", "gear": "equipment", "professions": "professions", "media": "character-media",
-           "lifetime": "achievements/statistics"}
+           "lifetime": "achievements/statistics", "achievements": "achievements", "reputations": "reputations",
+           "quests": "quests", "pvp": "pvp-summary", "hunterPets": "hunter-pets",
+           "specializations": "specializations"}  # "icons" nema vlastni dokument, doplnuje gear[].iconUrl
+# Sekce, kde API vraci nazvy jen anglicky (v jinem jazyce jsou null), proto se vzdy zada en_GB
+_EN_SECTIONS = {"lifetime", "achievements", "reputations", "quests", "pvp", "hunterPets", "specializations"}
 # Statistiky za celou dobu: id statistiky -> klic ve `lifetime.highlights` (id jsou stabilni, nazvy jen anglicky)
 _LIFETIME_KEYS = {
     60: "deaths", 1501: "deathsFromPlayers", 318: "deathsFromOppositeFaction", 114: "deathsFalling",
@@ -125,6 +133,94 @@ def _build_lifetime(doc: dict) -> dict | None:
     return {"highlights": hl, "all": rows}
 
 
+def _iso_ms(ts) -> str | None:
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts:
+        return datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
+    return None
+
+
+def _build_achievements(doc: dict) -> dict | None:
+    """Splnene uspechy s casem splneni (rozpracovane se vynechavaji), serazene podle casu."""
+    if "achievements" not in doc and "total_quantity" not in doc:
+        return None
+    completed = []
+    for a in doc.get("achievements") or []:
+        at = _iso_ms(a.get("completed_timestamp"))
+        if at:
+            ach = a.get("achievement") or {}
+            completed.append({"id": ach.get("id", a.get("id")), "name": ach.get("name"), "completedAt": at})
+    completed.sort(key=lambda x: x["completedAt"])
+    recent = [{"id": (e.get("achievement") or {}).get("id"), "name": (e.get("achievement") or {}).get("name"),
+               "at": _iso_ms(e.get("timestamp"))} for e in doc.get("recent_events") or []]
+    cats = [{"id": (c.get("category") or {}).get("id"), "name": (c.get("category") or {}).get("name"),
+             "quantity": c.get("quantity"), "points": c.get("points")} for c in doc.get("category_progress") or []]
+    return {"total": doc.get("total_quantity", len(completed)), "points": doc.get("total_points", 0),
+            "completed": completed, "recent": recent, "categories": cats}
+
+
+def _build_reputations(doc: dict) -> list | None:
+    """Reputace u frakci, serazene: nejvyssi uroven (tier) prvni, pak nazev."""
+    if "reputations" not in doc:
+        return None
+    out = []
+    for r in doc["reputations"] or []:
+        f, s = r.get("faction") or {}, r.get("standing") or {}
+        out.append({"id": f.get("id"), "name": f.get("name"), "standing": s.get("name"), "tier": s.get("tier"),
+                    "value": s.get("value"), "max": s.get("max"), "raw": s.get("raw")})
+    out.sort(key=lambda x: (-(x["tier"] if x["tier"] is not None else -1), x["name"] or ""))
+    return out
+
+
+def _build_quests(doc: dict, done: dict) -> dict | None:
+    if "in_progress" not in doc and "quests" not in done:
+        return None
+    simple = lambda xs: [{"id": q.get("id"), "name": q.get("name")} for q in xs or []]
+    completed = simple(done["quests"]) if "quests" in done else None  # None = seznam se nepodarilo ziskat
+    return {"completedCount": len(completed) if completed is not None else None,
+            "completed": completed, "inProgress": simple(doc.get("in_progress"))}
+
+
+def _build_pvp(doc: dict) -> dict | None:
+    if "honorable_kills" not in doc and "pvp_map_statistics" not in doc:
+        return None
+    bgs = []
+    for m in doc.get("pvp_map_statistics") or []:
+        wm, ms = m.get("world_map") or {}, m.get("match_statistics") or {}
+        bgs.append({"id": wm.get("id"), "name": wm.get("name"), "played": ms.get("played", 0),
+                    "won": ms.get("won", 0), "lost": ms.get("lost", 0)})
+    return {"honorableKills": doc.get("honorable_kills", 0), "rank": doc.get("pvp_rank", 0), "battlegrounds": bgs}
+
+
+def _build_hunter_pets(doc: dict) -> list | None:
+    if "hunter_pets" not in doc:  # ne-lovci: API vraci 404
+        return None
+    return [{"name": p.get("name"), "level": p.get("level"), "slot": p.get("slot"),
+             "active": bool(p.get("is_active")), "summoned": bool(p.get("is_summoned")),
+             "creatureId": (p.get("creature") or {}).get("id"), "creature": (p.get("creature") or {}).get("name")}
+            for p in doc["hunter_pets"] or []]
+
+
+def _build_specializations(doc: dict) -> list | None:
+    """[{active, specializations: [{id, name, points, talents: [{id, name, rank, spellId, description}]}]}]"""
+    if "specialization_groups" not in doc:
+        return None
+    groups = []
+    for g in doc["specialization_groups"] or []:
+        specs = []
+        for s in g.get("specializations") or []:
+            sp = s.get("specialization") or {}
+            talents = []
+            for t in s.get("talents") or []:
+                tip = t.get("spell_tooltip") or {}
+                talents.append({"id": (t.get("talent") or {}).get("id"), "name": (t.get("talent") or {}).get("name"),
+                                "rank": t.get("talent_rank"), "spellId": (tip.get("spell") or {}).get("id"),
+                                "description": tip.get("description")})
+            specs.append({"id": sp.get("id"), "name": sp.get("name") or s.get("specialization_name"),
+                          "points": s.get("spent_points", sum(t["rank"] or 0 for t in talents)), "talents": talents})
+        groups.append({"active": bool(g.get("is_active")), "specializations": specs})
+    return groups
+
+
 def _http(url: str, token: str | None = None, data: bytes | None = None, basic: str | None = None):
     req = urllib.request.Request(url, data=data, headers={"User-Agent": _UA})
     if token:
@@ -169,6 +265,8 @@ class ForeverClient:
         self._names: dict | None = None
         self._items: dict | None = None
         self._items_dirty = False
+        self._icons: dict | None = None
+        self._icons_dirty = False
         self._wh_last = 0.0
 
     @classmethod
@@ -268,17 +366,48 @@ class ForeverClient:
             _write_json(self.cache_dir / "items.json", self._items)
             self._items_dirty = False
 
+    # --- ikony itemu: Blizzard /data/wow/media/item/{id}, trvale cachovano v icons.json ---
+    def _item_icon(self, item_id: int):
+        if self._icons is None:
+            self._icons = _read_json(self.cache_dir / "icons.json") or {}
+        key = str(int(item_id))
+        e = self._icons.get(key)
+        if e and (e.get("url") or time.time() - e.get("t", 0) < _NEG_TTL):
+            return e.get("url")  # zname se nikdy nepreptava; nenalezene az po _NEG_TTL
+        st, body = self._api(f"/data/wow/media/item/{key}", "static", "en_GB")
+        url = None
+        if st == 200 and isinstance(body, dict):
+            url = next((a.get("value") for a in body.get("assets") or [] if a.get("key") == "icon"), None)
+        if url or st == 404:  # docasne chyby se necachuji
+            self._icons[key] = {"url": url, "t": time.time()}
+            self._icons_dirty = True
+        return url
+
+    def _flush_icons(self) -> None:
+        if self._icons_dirty:
+            _write_json(self.cache_dir / "icons.json", self._icons)
+            self._icons_dirty = False
+
     # --- verejne API ---
-    def get_character(self, name: str, *, sections=ALL_SECTIONS, ttl: int | None = None,
+    def get_character(self, name: str, *, sections=DEFAULT_SECTIONS, ttl: int | None = None,
                       refresh: bool = False) -> dict:
-        """Vrati dict s postavou. `name` je slug nebo 'Jmeno Prijmeni'. `sections` omezi pocet dotazu."""
+        """Vrati dict s postavou. `name` je slug nebo 'Jmeno Prijmeni'.
+
+        `sections`: seznam, retezec oddeleny carkami, "default" nebo "all". Kazda sekce je aspon jeden HTTP dotaz.
+        Sekce `icons` doplni `gear[].iconUrl` (a proto automaticky zahrne `gear`)."""
         slug = slugify(name)
         if not _SLUG_RE.match(slug):
             raise CharacterNotFound(f"Neplatne jmeno postavy: {name!r}")
-        secs = tuple(s for s in ALL_SECTIONS if s in set(sections))
-        bad = set(sections) - set(ALL_SECTIONS)
+        if isinstance(sections, str):
+            sections = (ALL_SECTIONS if sections == "all" else DEFAULT_SECTIONS if sections == "default"
+                        else [x.strip() for x in sections.split(",") if x.strip()])
+        want = set(sections)
+        bad = want - set(ALL_SECTIONS)
         if bad:
             raise ConfigError(f"Neznama sekce: {', '.join(sorted(bad))} (platne: {', '.join(ALL_SECTIONS)})")
+        if "icons" in want:
+            want.add("gear")
+        secs = tuple(s for s in ALL_SECTIONS if s in want)
         cf = self.cache_dir / f"char-{self.region}-{slug}-{'+'.join(secs) or 'summary'}.json"
         return self._with_cache(cf, ttl, refresh, lambda: self._fetch(slug, secs))
 
@@ -351,9 +480,14 @@ class ForeverClient:
             raise UpstreamError(f"Profil: HTTP {st}")
         sub = {}
         for s in secs:
-            # nazvy statistik vraci API jen anglicky, jinak jsou null
-            st2, b = self._api(f"{base}/{_SUBDOC[s]}", locale="en_GB" if s == "lifetime" else None)
+            if s not in _SUBDOC:  # "icons" nema vlastni dokument
+                continue
+            # u techto sekci vraci API nazvy jen anglicky, jinak jsou null
+            st2, b = self._api(f"{base}/{_SUBDOC[s]}", locale="en_GB" if s in _EN_SECTIONS else None)
             sub[s] = b if st2 == 200 and isinstance(b, dict) else {}
+        if "quests" in sub:
+            st3, done = self._api(f"{base}/quests/completed", locale="en_GB")
+            sub["quests_completed"] = done if st3 == 200 and isinstance(done, dict) else {}
 
         login = p.get("last_login_timestamp")
         out = {
@@ -376,6 +510,10 @@ class ForeverClient:
                 "quality": it["quality"]["type"].title(),
                 "itemLevel": (it.get("level") or {}).get("value"),
             } for it in sub["gear"].get("equipped_items", [])]
+            if "icons" in secs:
+                for g in out["gear"]:
+                    g["iconUrl"] = self._item_icon(g["itemId"])
+                self._flush_icons()
             self._flush_items()
         if "professions" in sub:
             out["professions"] = []
@@ -390,6 +528,18 @@ class ForeverClient:
                     })
         if "lifetime" in sub:
             out["lifetime"] = _build_lifetime(sub["lifetime"])
+        if "achievements" in sub:
+            out["achievements"] = _build_achievements(sub["achievements"])
+        if "reputations" in sub:
+            out["reputations"] = _build_reputations(sub["reputations"])
+        if "quests" in sub:
+            out["quests"] = _build_quests(sub["quests"], sub["quests_completed"])
+        if "pvp" in sub:
+            out["pvp"] = _build_pvp(sub["pvp"])
+        if "hunterPets" in sub:
+            out["hunterPets"] = _build_hunter_pets(sub["hunterPets"])
+        if "specializations" in sub:
+            out["specializations"] = _build_specializations(sub["specializations"])
         if "media" in sub:
             a = {x["key"]: x["value"] for x in sub["media"].get("assets", [])}
             out["avatarUrl"], out["renderUrl"] = a.get("avatar"), a.get("main-sd-raw")

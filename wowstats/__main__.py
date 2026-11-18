@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 
-from . import ALL_SECTIONS, ForeverClient, WowStatsError
+from . import ALL_SECTIONS, DEFAULT_SECTIONS, ForeverClient, WowStatsError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,8 +27,9 @@ def _parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("character", parents=[common], help="data postavy")
     c.add_argument("name", help="slug nebo 'Jmeno Prijmeni', napr. jmeno-prijmeni")
-    c.add_argument("--sections", default=",".join(ALL_SECTIONS),
-                   help=f"carkou oddelene: {','.join(ALL_SECTIONS)} (mene sekci = mene dotazu)")
+    c.add_argument("--sections", default="default",
+                   help=f"'default' ({','.join(DEFAULT_SECTIONS)}), 'all', nebo carkou oddelene z: "
+                        f"{','.join(ALL_SECTIONS)}. Kazda sekce je aspon jeden dotaz; 'icons' automaticky pridava 'gear'")
     c.add_argument("--no-wowhead", action="store_true", help="nedoplnovat nazvy itemu z Wowheadu")
 
     g = sub.add_parser("guild", parents=[common], help="guilda a seznam clenu")
@@ -48,8 +49,7 @@ def main(argv=None) -> int:
         if a.cmd == "guild":
             data = client.get_guild(a.name, ttl=a.ttl, refresh=a.refresh)
         else:
-            secs = [s.strip() for s in a.sections.split(",") if s.strip()]
-            data = client.get_character(a.name, sections=secs, ttl=a.ttl, refresh=a.refresh)
+            data = client.get_character(a.name, sections=a.sections, ttl=a.ttl, refresh=a.refresh)
     except WowStatsError as e:
         print(json.dumps({"error": str(e), "code": e.code}, ensure_ascii=False), file=sys.stderr)
         return e.code
