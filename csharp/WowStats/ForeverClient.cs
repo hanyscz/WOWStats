@@ -12,6 +12,16 @@ public sealed partial class ForeverClient : IDisposable
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = false };
     private static readonly HashSet<string> StatSkip = ["_links", "character", "power_type"];
 
+    // id statistiky -> klíč v Lifetime.Highlights (id jsou stabilní, názvy jen anglicky)
+    private static readonly Dictionary<int, string> LifetimeKeys = new()
+    {
+        [60] = "deaths", [1501] = "deathsFromPlayers", [318] = "deathsFromOppositeFaction", [114] = "deathsFalling",
+        [112] = "deathsDrowning", [115] = "deathsFireLava", [321] = "deathsDungeonsRaids",
+        [1197] = "totalKills", [588] = "honorableKills", [1487] = "killingBlows", [98] = "questsCompleted",
+        [94] = "questsAbandoned", [64222] = "timesCamped", [839] = "battlegroundsPlayed", [840] = "battlegroundsWon",
+        [932] = "dungeonsEntered", [349] = "flightPaths", [353] = "timesHearthed", [1456] = "fishCaught",
+    };
+
     private readonly ForeverOptions _o;
     private readonly HttpClient _http;
     private readonly bool _ownsHttp;
@@ -142,6 +152,10 @@ public sealed partial class ForeverClient : IDisposable
         JsonElement? gear = secs.HasFlag(CharacterSections.Gear) ? await Sub("equipment") : null;
         JsonElement? profs = secs.HasFlag(CharacterSections.Professions) ? await Sub("professions") : null;
         JsonElement? media = secs.HasFlag(CharacterSections.Media) ? await Sub("character-media") : null;
+        // názvy statistik vrací API jen anglicky, jinak jsou null
+        JsonElement? lifetime = secs.HasFlag(CharacterSections.Lifetime)
+            ? (await ApiAsync($"{baseP}/achievements/statistics", "profile", "en_GB", ct)) is (200, { } lt) ? lt : null
+            : null;
 
         var rulesetId = prof.Path("ruleset", "id")?.GetInt32();
         long? login = prof.Path("last_login_timestamp")?.GetInt64();
@@ -166,10 +180,37 @@ public sealed partial class ForeverClient : IDisposable
             Stats: stats is null ? null : BuildStats(stats.Value),
             Gear: gearList,
             Professions: profList,
+            Lifetime: lifetime is null ? null : BuildLifetime(lifetime.Value),
             AvatarUrl: assets?.GetValueOrDefault("avatar"),
             RenderUrl: assets?.GetValueOrDefault("main-sd-raw"),
             FetchedAt: DateTimeOffset.UtcNow,
             Stale: false);
+    }
+
+    private static LifetimeStats? BuildLifetime(JsonElement doc)
+    {
+        if (doc.Path("categories") is not { ValueKind: JsonValueKind.Array } cats) return null;
+        var rows = new List<LifetimeStat>();
+        void Walk(JsonElement list, string path)
+        {
+            foreach (var x in list.EnumerateArray())
+            {
+                var name = x.Path("name")?.GetString();
+                var p = path.Length == 0 ? name ?? "" : $"{path}/{name}";
+                if (x.Path("statistics") is { ValueKind: JsonValueKind.Array } stats)
+                    foreach (var s in stats.EnumerateArray())
+                        if (s.Path("quantity") is { ValueKind: JsonValueKind.Number } q && s.Path("id") is { } id)
+                            rows.Add(new LifetimeStat(id.GetInt32(), p, s.Path("name")?.GetString(),
+                                Math.Round(q.GetDouble(), 2), s.Path("description")?.GetString()));
+                if (x.Path("sub_categories") is { ValueKind: JsonValueKind.Array } subs) Walk(subs, p);
+            }
+        }
+        Walk(cats, "");
+
+        var byId = rows.GroupBy(r => r.Id).ToDictionary(g => g.Key, g => g.First().Value);
+        var hl = LifetimeKeys.ToDictionary(kv => kv.Value, kv => byId.GetValueOrDefault(kv.Key));
+        hl["deathsInBattlegrounds"] = rows.Where(r => r.Category == "Deaths/Battlegrounds").Sum(r => r.Value);
+        return new LifetimeStats(hl, rows);
     }
 
     private static Dictionary<string, double> BuildStats(JsonElement stats)

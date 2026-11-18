@@ -38,6 +38,8 @@ foreach (var m in g.Members.Take(5))                    // seřazeno: rank, leve
 | `GetCharacterAsync(name, sections, ttl, refresh, ct)` | `name` je slug nebo `"Jmeno Prijmeni"`; nevyžádané sekce jsou `null` |
 | `GetGuildAsync(name, ttl, refresh, ct)` | `name` je název guildy nebo slug; vrací `Guild` se seznamem `Members` |
 
+`CharacterSections.Lifetime` stáhne statistiky za celou dobu (`Character.Lifetime`): `Highlights` (např. `deaths`, `deathsFalling`, `totalKills`, `questsCompleted`; chybějící statistika = 0) a `All` se všemi statistikami (`Id`, `Category`, `Name`, `Value`). Názvy a kategorie jsou jen anglicky. Přehled klíčů je v [../README.md](../README.md#statistiky-za-celou-dobu-lifetime).
+
 `Guild`: `Name`, `Slug`, `Id`, `Faction`, `MemberCount`, `AchievementPoints`, `CreatedAt`, `Ruleset`, `Members`, `FetchedAt`, `Stale`.
 `GuildMember`: `Name`, `Surname`, `Slug`, `Level`, `CharacterClass`, `Race`, `Faction`, `Rank` (číslo, 0 bývá vedoucí; názvy ranků API nevrací). `Slug` člena jde použít v `GetCharacterAsync`. Aktivita, guildové achievementy a banka API neposkytuje.
 

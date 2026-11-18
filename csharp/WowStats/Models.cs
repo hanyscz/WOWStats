@@ -9,8 +9,19 @@ public enum CharacterSections
     Gear = 2,
     Professions = 4,
     Media = 8,
-    All = Stats | Gear | Professions | Media,
+    /// <summary>Statistiky za celou dobu (smrti, zabití, questy…) z achievements/statistics.</summary>
+    Lifetime = 16,
+    All = Stats | Gear | Professions | Media | Lifetime,
 }
+
+/// <summary>Jedna statistika za celou dobu. Názvy a kategorie jsou jen anglicky.</summary>
+public sealed record LifetimeStat(int Id, string Category, string? Name, double Value, string? Description);
+
+/// <summary>
+/// Highlights: vybrané statistiky pod stabilními klíči (deaths, deathsFalling, totalKills, questsCompleted…);
+/// chybějící statistika = 0. All: všechny statistiky, které API vrátilo.
+/// </summary>
+public sealed record LifetimeStats(IReadOnlyDictionary<string, double> Highlights, IReadOnlyList<LifetimeStat> All);
 
 public sealed record GearItem(string Slot, int ItemId, string? Name, string Quality, int? ItemLevel);
 
@@ -32,6 +43,7 @@ public sealed record Character(
     IReadOnlyDictionary<string, double>? Stats,
     IReadOnlyList<GearItem>? Gear,
     IReadOnlyList<Profession>? Professions,
+    LifetimeStats? Lifetime,
     string? AvatarUrl,
     string? RenderUrl,
     DateTimeOffset FetchedAt,

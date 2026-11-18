@@ -17,8 +17,17 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-ALL_SECTIONS = ("stats", "gear", "professions", "media")
-_SUBDOC = {"stats": "statistics", "gear": "equipment", "professions": "professions", "media": "character-media"}
+ALL_SECTIONS = ("stats", "gear", "professions", "media", "lifetime")
+_SUBDOC = {"stats": "statistics", "gear": "equipment", "professions": "professions", "media": "character-media",
+           "lifetime": "achievements/statistics"}
+# Statistiky za celou dobu: id statistiky -> klic ve `lifetime.highlights` (id jsou stabilni, nazvy jen anglicky)
+_LIFETIME_KEYS = {
+    60: "deaths", 1501: "deathsFromPlayers", 318: "deathsFromOppositeFaction", 114: "deathsFalling",
+    112: "deathsDrowning", 115: "deathsFireLava", 321: "deathsDungeonsRaids",
+    1197: "totalKills", 588: "honorableKills", 1487: "killingBlows", 98: "questsCompleted",
+    94: "questsAbandoned", 64222: "timesCamped", 839: "battlegroundsPlayed", 840: "battlegroundsWon",
+    932: "dungeonsEntered", 349: "flightPaths", 353: "timesHearthed", 1456: "fishCaught",
+}
 _SLUG_RE = re.compile(r"^[\w-]{1,60}$")
 _STAT_SKIP = {"_links", "character", "power_type"}
 _UA = "wowstats/0.1"
@@ -88,6 +97,32 @@ def _num(v):
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
     return round(v, 2) if isinstance(v, float) else v
+
+
+def _build_lifetime(doc: dict) -> dict | None:
+    """Z `achievements/statistics` udela {"highlights": {...}, "all": [...]}. Chybejici statistika = 0."""
+    if "categories" not in doc:
+        return None
+    rows: list[dict] = []
+
+    def walk(cats, path=""):
+        for x in cats:
+            p = f"{path}/{x.get('name')}" if path else str(x.get("name"))
+            for s in x.get("statistics") or []:
+                v = s.get("quantity")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    row = {"id": s.get("id"), "category": p, "name": s.get("name"),
+                           "value": int(v) if float(v).is_integer() else round(v, 2)}
+                    if s.get("description"):
+                        row["description"] = s["description"]
+                    rows.append(row)
+            walk(x.get("sub_categories") or [], p)
+
+    walk(doc.get("categories") or [])
+    by_id = {r["id"]: r["value"] for r in rows}
+    hl = {key: by_id.get(i, 0) for i, key in _LIFETIME_KEYS.items()}
+    hl["deathsInBattlegrounds"] = sum(r["value"] for r in rows if r["category"] == "Deaths/Battlegrounds")
+    return {"highlights": hl, "all": rows}
 
 
 def _http(url: str, token: str | None = None, data: bytes | None = None, basic: str | None = None):
@@ -316,7 +351,8 @@ class ForeverClient:
             raise UpstreamError(f"Profil: HTTP {st}")
         sub = {}
         for s in secs:
-            st2, b = self._api(f"{base}/{_SUBDOC[s]}")
+            # nazvy statistik vraci API jen anglicky, jinak jsou null
+            st2, b = self._api(f"{base}/{_SUBDOC[s]}", locale="en_GB" if s == "lifetime" else None)
             sub[s] = b if st2 == 200 and isinstance(b, dict) else {}
 
         login = p.get("last_login_timestamp")
@@ -352,6 +388,8 @@ class ForeverClient:
                         "skill": sum(t.get("skill_points", 0) for t in tiers),
                         "maxSkill": sum(t.get("max_skill_points", 0) for t in tiers),
                     })
+        if "lifetime" in sub:
+            out["lifetime"] = _build_lifetime(sub["lifetime"])
         if "media" in sub:
             a = {x["key"]: x["value"] for x in sub["media"].get("assets", [])}
             out["avatarUrl"], out["renderUrl"] = a.get("avatar"), a.get("main-sd-raw")

@@ -37,6 +37,8 @@ try
     if (c.Stats is { } s) Console.WriteLine($"stats: {s.Count}, attack power {s.GetValueOrDefault("attack_power")}");
     if (c.Gear is { } g) Console.WriteLine($"gear: {g.Count} itemů, bez názvu {g.Count(i => i.Name is null)}");
     if (c.Professions is { } p) Console.WriteLine("profese: " + string.Join(", ", p.Select(x => $"{x.Name} {x.Skill}/{x.MaxSkill}")));
+    if (c.Lifetime is { } lt)
+        Console.WriteLine($"za celou dobu: smrtí {lt.Highlights["deaths"]} (pády {lt.Highlights["deathsFalling"]}, od hráčů {lt.Highlights["deathsFromPlayers"]}), zabití {lt.Highlights["totalKills"]}, questů {lt.Highlights["questsCompleted"]} [{lt.All.Count} statistik]");
     Console.WriteLine($"avatar: {c.AvatarUrl ?? "-"} | stale: {c.Stale}");
     return 0;
 }

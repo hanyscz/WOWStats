@@ -26,6 +26,15 @@ STATS = {"_links": {}, "character": {}, "attack_power": 262, "strength": {"base"
          "melee_crit": {"value": 3.5904002}}
 PROFESSIONS = {"primaries": [{"profession": {"id": 165, "name": "Leatherworking"},
                               "tiers": [{"skill_points": 120, "max_skill_points": 150}]}], "secondaries": []}
+LIFETIME = {"categories": [
+    {"name": "Deaths", "statistics": [{"id": 60, "name": "Total deaths", "quantity": 33.0}], "sub_categories": [
+        {"name": "World", "statistics": [{"id": 114, "name": "Deaths from falling", "quantity": 1.0}]},
+        {"name": "Battlegrounds", "statistics": [{"id": 56, "name": "Deaths in WSG", "quantity": 2.0},
+                                                 {"id": 59, "name": "Deaths in AB", "quantity": 3.0}]}]},
+    {"name": "Kills", "statistics": [{"id": 1197, "name": "Total kills", "quantity": 3838.0},
+                                     {"id": 1336, "name": "Creature type killed the most", "quantity": 20.5,
+                                      "description": "Beasts"}]},
+]}
 MEDIA = {"assets": [{"key": "avatar", "value": "https://example.test/a.jpg"},
                     {"key": "main-sd-raw", "value": "https://example.test/m.png"}]}
 GUILD = {"id": 7, "name": "Test Guild", "faction": {"type": "HORDE"}, "member_count": 3,
@@ -47,6 +56,7 @@ class Fake:
     def __init__(self, items=None, wowhead=None, profile_status=200, guild_status=200):
         self.items, self.wowhead, self.profile_status = items or {}, wowhead or {}, profile_status
         self.guild_status = guild_status
+        self.lifetime_ok = True
         self.calls = []
 
     def count(self, part):
@@ -78,7 +88,9 @@ class Fake:
         if path == base:
             return (200, PROFILE) if self.profile_status == 200 else (self.profile_status, None)
         sub = {"/equipment": EQUIPMENT, "/statistics": STATS, "/professions": PROFESSIONS,
-               "/character-media": MEDIA}
+               "/character-media": MEDIA, "/achievements/statistics": LIFETIME}
+        if path.endswith("/achievements/statistics") and not self.lifetime_ok:
+            return 500, None
         if path.startswith(base) and path[len(base):] in sub:
             return 200, sub[path[len(base):]]
         return 404, None
@@ -115,6 +127,24 @@ class ClientTests(unittest.TestCase):
                                              "skill": 120, "maxSkill": 150}])
         self.assertEqual(c["avatarUrl"], "https://example.test/a.jpg")
         self.assertFalse(c["stale"])
+
+    def test_lifetime_statistics(self):
+        c = self.client(locale="cs_CZ").get_character("test-char", sections=["lifetime"])
+        hl = c["lifetime"]["highlights"]
+        self.assertEqual((hl["deaths"], hl["deathsFalling"], hl["totalKills"]), (33, 1, 3838))
+        self.assertEqual(hl["deathsInBattlegrounds"], 5)   # soucet kategorie Deaths/Battlegrounds
+        self.assertEqual(hl["deathsDrowning"], 0)          # chybejici statistika = 0
+        row = next(r for r in c["lifetime"]["all"] if r["id"] == 114)
+        self.assertEqual((row["category"], row["name"], row["value"]), ("Deaths/World", "Deaths from falling", 1))
+        self.assertEqual(next(r for r in c["lifetime"]["all"] if r["id"] == 1336)["description"], "Beasts")
+        # nazvy statistik jsou jen anglicky, i kdyz klient pouziva cs_CZ
+        call = next(u for u in self.fake.calls if "achievements/statistics" in u)
+        self.assertIn("locale=en_GB", call)
+        self.assertNotIn("stats", c)
+
+    def test_lifetime_missing_when_api_fails(self):
+        self.fake.lifetime_ok = False
+        self.assertIsNone(self.client().get_character("test-char", sections=["lifetime"])["lifetime"])
 
     def test_sections_limit_requests(self):
         c = self.client().get_character("test-char", sections=["stats"])
